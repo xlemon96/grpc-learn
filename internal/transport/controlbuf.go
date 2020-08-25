@@ -83,21 +83,14 @@ func (il *itemList) isEmpty() bool {
 	return il.head == nil
 }
 
-// The following defines various control items which could flow through
-// the control buffer of transport. They represent different aspects of
-// control tasks, e.g., flow control, settings, streaming resetting, etc.
-
-// maxQueuedTransportResponseFrames is the most queued "transport response"
-// frames we will buffer before preventing new reads from occurring on the
-// transport.  These are control frames sent in response to client requests,
-// such as RST_STREAM due to bad headers or settings acks.
+// 同时能够发送的最大响应stream帧的数量
 const maxQueuedTransportResponseFrames = 50
 
 type cbItem interface {
 	isTransportResponseFrame() bool
 }
 
-// 注册一个incoming stream到loopy writer.
+// 注册一个incoming stream到loopy writer
 type registerStream struct {
 	streamID uint32
 	wq       *writeQuota
@@ -106,8 +99,9 @@ type registerStream struct {
 func (*registerStream) isTransportResponseFrame() bool { return false }
 
 // 在client-side，此frame也用于注册
+// 服务端发送客户端响应的header帧
 type headerFrame struct {
-	streamID   uint32
+	streamID   uint32 // 流id
 	hf         []hpack.HeaderField
 	endStream  bool               // Valid on server side.
 	initStream func(uint32) error // Used only on the client side.
@@ -130,6 +124,7 @@ type cleanupStream struct {
 
 func (c *cleanupStream) isTransportResponseFrame() bool { return c.rst } // Results in a RST_STREAM
 
+// 数据帧
 type dataFrame struct {
 	streamID    uint32
 	endStream   bool
@@ -140,6 +135,7 @@ type dataFrame struct {
 
 func (*dataFrame) isTransportResponseFrame() bool { return false }
 
+// 窗口更新帧
 type incomingWindowUpdate struct {
 	streamID  uint32
 	increment uint32
@@ -156,6 +152,7 @@ func (*outgoingWindowUpdate) isTransportResponseFrame() bool {
 	return false // window updates are throttled by thresholds
 }
 
+// setting帧
 type incomingSettings struct {
 	ss []http2.Setting
 }
@@ -249,16 +246,17 @@ func (l *outStreamList) dequeue() *outStream {
 }
 
 type controlBuffer struct {
-	ch                      chan struct{}
-	done                    <-chan struct{}
-	mu                      sync.Mutex
-	consumerWaiting         bool // 是否有消费者在等待
-	list                    *itemList
-	err                     error
-	transportResponseFrames int
-	trfChan                 atomic.Value
+	ch                      chan struct{}   // 通过此ch唤醒等待读取元素的g
+	done                    <-chan struct{} // 结束chan
+	mu                      sync.Mutex      // 锁
+	consumerWaiting         bool            // 是否有消费者在等待
+	list                    *itemList       // 元素列表
+	err                     error           // 错误信息
+	transportResponseFrames int             // 当前响应流的个数
+	trfChan                 atomic.Value    // 控制trf
 }
 
+// 初始化一个controlBuffer
 func newControlBuffer(done <-chan struct{}) *controlBuffer {
 	return &controlBuffer{
 		ch:   make(chan struct{}, 1),
@@ -282,9 +280,11 @@ func (c *controlBuffer) put(it cbItem) error {
 	return err
 }
 
+// 放入一个元素到controlBuffer
 func (c *controlBuffer) executeAndPut(f func(it interface{}) bool, it cbItem) (bool, error) {
 	var wakeUp bool
 	c.mu.Lock()
+	// 错误信息不为空，直接返回
 	if c.err != nil {
 		c.mu.Unlock()
 		return false, c.err
@@ -295,6 +295,7 @@ func (c *controlBuffer) executeAndPut(f func(it interface{}) bool, it cbItem) (b
 			return false, nil
 		}
 	}
+	// 如果有消费者等待，唤醒
 	if c.consumerWaiting {
 		wakeUp = true
 		c.consumerWaiting = false
@@ -308,6 +309,7 @@ func (c *controlBuffer) executeAndPut(f func(it interface{}) bool, it cbItem) (b
 		}
 	}
 	c.mu.Unlock()
+	// 若wakeUp为true，则向ch写入数据
 	if wakeUp {
 		select {
 		case c.ch <- struct{}{}:
@@ -356,6 +358,8 @@ func (c *controlBuffer) get(block bool) (interface{}, error) {
 			c.mu.Unlock()
 			return nil, nil
 		}
+		// 若此时队列元素为空，则consumerWaiting置为true
+		// 同时监听ch和done chan
 		c.consumerWaiting = true
 		c.mu.Unlock()
 		select {
@@ -367,6 +371,8 @@ func (c *controlBuffer) get(block bool) (interface{}, error) {
 	}
 }
 
+// 若done chan有值，则证明client取消了调用
+// 需要将未发送的header帧取消
 func (c *controlBuffer) finish() {
 	c.mu.Lock()
 	if c.err != nil {
@@ -391,19 +397,18 @@ func (c *controlBuffer) finish() {
 type loopyWriter struct {
 	side      side
 	cbuf      *controlBuffer // frame控制器
-	sendQuota uint32         // 发送配额
+	sendQuota uint32         // 发送配额(流级别)
 	oiws      uint32         // 出方向初始化的窗口大小
 	// 表示已经建立连接的stream并且没有被cleaned-up
 	// 用作客户端的时候，表示那些头部已经被发出去的stream
 	// 用作服务端的时候，表示那些头部已经被收到的stream
-	estdStreams   map[uint32]*outStream
-	activeStreams *outStreamList // 活动的stream
-	framer        *framer        // 二进制帧控制器
-	hBuf          *bytes.Buffer  // 哈夫曼编码的buffer
-	hEnc          *hpack.Encoder // 哈夫曼编码器
-	bdpEst        *bdpEstimator
-	draining      bool
-	// Side-specific handlers
+	estdStreams     map[uint32]*outStream
+	activeStreams   *outStreamList // 活动的stream
+	framer          *framer        // 二进制帧控制器
+	hBuf            *bytes.Buffer  // 哈夫曼编码的buffer
+	hEnc            *hpack.Encoder // 哈夫曼编码器
+	bdpEst          *bdpEstimator
+	draining        bool
 	ssGoAwayHandler func(*goAway) (bool, error)
 }
 
@@ -424,6 +429,9 @@ func newLoopyWriter(s side, fr *framer, cbuf *controlBuffer, bdpEst *bdpEstimato
 	return l
 }
 
+// loopyWriter主循环，主要分为两部操作：
+//	  1、处理controlBuffer的frame
+//	  2、处理activeStream未发送的数据
 func (l *loopyWriter) run() (err error) {
 	defer func() {
 		if err == ErrConnClosing {
@@ -438,18 +446,22 @@ func (l *loopyWriter) run() (err error) {
 		}
 	}()
 	for {
+		// 阻塞读取frame
 		it, err := l.cbuf.get(true)
 		if err != nil {
 			return err
 		}
+		// 处理frame
 		if err = l.handle(it); err != nil {
 			return err
 		}
+		// 处理activeStream未发送的数据
 		if _, err = l.processData(); err != nil {
 			return err
 		}
-		gosched := true
-	hasdata:
+		// 修改schedule和hasData两个参数名称，编译器飘波浪线，看着难受
+		schedule := true
+	hasData:
 		// 内层循环
 		// 优化点：若有数据，则get数据不需要阻塞，直接for循环
 		// controlBuffer没有数据不代表没有data帧需要处理
@@ -465,7 +477,7 @@ func (l *loopyWriter) run() (err error) {
 				if _, err = l.processData(); err != nil {
 					return err
 				}
-				continue hasdata
+				continue hasData
 			}
 			isEmpty, err := l.processData()
 			if err != nil {
@@ -473,28 +485,64 @@ func (l *loopyWriter) run() (err error) {
 			}
 			// 若非空，则继续内层循环
 			if !isEmpty {
-				continue hasdata
+				continue hasData
 			}
 			// 否则发起调度，让出cpu给其他g
 			// 仅当buffer小于最小的批量发布数据的大小的时候
-			if gosched {
-				gosched = false
+			if schedule {
+				schedule = false
 				if l.framer.writer.offset < minBatchSize {
 					runtime.Gosched()
-					continue hasdata
+					continue hasData
 				}
 			}
+			// 刷新framer缓冲区
 			l.framer.writer.Flush()
-			break hasdata
+			break hasData
 		}
 	}
 }
 
+// 根据buf item的类型，选择不同的处理函数
+func (l *loopyWriter) handle(i interface{}) error {
+	switch i := i.(type) {
+	case *incomingWindowUpdate:
+		return l.incomingWindowUpdateHandler(i)
+	case *outgoingWindowUpdate:
+		return l.outgoingWindowUpdateHandler(i)
+	case *incomingSettings:
+		return l.incomingSettingsHandler(i)
+	case *outgoingSettings:
+		return l.outgoingSettingsHandler(i)
+	case *headerFrame:
+		return l.headerHandler(i)
+	case *registerStream:
+		return l.registerStreamHandler(i)
+	case *cleanupStream:
+		return l.cleanupStreamHandler(i)
+	case *incomingGoAway:
+		return l.incomingGoAwayHandler(i)
+	case *dataFrame:
+		return l.preprocessData(i)
+	case *ping:
+		return l.pingHandler(i)
+	case *goAway:
+		return l.goAwayHandler(i)
+	case *outFlowControlSizeRequest:
+		return l.outFlowControlSizeRequestHandler(i)
+	default:
+		return fmt.Errorf("transport: unknown control message type %T", i)
+	}
+}
+
+// 服务器发出的更新窗口
+// 告知客户端发送窗口可以增加(默认是16k)
 func (l *loopyWriter) outgoingWindowUpdateHandler(w *outgoingWindowUpdate) error {
 	return l.framer.fr.WriteWindowUpdate(w.streamID, w.increment)
 }
 
 // 客户端发送的更新窗口，通知server可以发送更多的数据
+// 主要是限流
 func (l *loopyWriter) incomingWindowUpdateHandler(w *incomingWindowUpdate) error {
 	// 若stream_id为0，则为连接级别的流控
 	if w.streamID == 0 {
@@ -515,11 +563,12 @@ func (l *loopyWriter) incomingWindowUpdateHandler(w *incomingWindowUpdate) error
 	return nil
 }
 
-// 发送给客户端窗口更新帧
+// 发送给客户端的setting帧
 func (l *loopyWriter) outgoingSettingsHandler(s *outgoingSettings) error {
 	return l.framer.fr.WriteSettings(s.ss...)
 }
 
+// 客户端发送的setting帧
 func (l *loopyWriter) incomingSettingsHandler(s *incomingSettings) error {
 	if err := l.applySettings(s.ss); err != nil {
 		return err
@@ -556,11 +605,10 @@ func (l *loopyWriter) headerHandler(h *headerFrame) error {
 		}
 		// 若endStream为true，则server是想关闭stream
 		if str.state != empty {
-			// either active or waiting on stream quota.
-			// add it str's list of items.
 			str.itl.enqueue(h)
 			return nil
 		}
+		// 发送给客户端头帧
 		if err := l.writeHeader(h.streamID, h.endStream, h.hf, h.onWrite); err != nil {
 			return err
 		}
@@ -585,7 +633,7 @@ func (l *loopyWriter) originateStream(str *outStream) error {
 		if err == ErrConnClosing {
 			return err
 		}
-		// Other errors(errStreamDrain) need not close transport.
+		// 其他error不需要关闭transport
 		return nil
 	}
 	// 写header
@@ -601,6 +649,7 @@ func (l *loopyWriter) writeHeader(streamID uint32, endStream bool, hf []hpack.He
 	if onWrite != nil {
 		onWrite()
 	}
+	// 编码header属性
 	l.hBuf.Reset()
 	for _, f := range hf {
 		if err := l.hEnc.WriteField(f); err != nil {
@@ -613,6 +662,8 @@ func (l *loopyWriter) writeHeader(streamID uint32, endStream bool, hf []hpack.He
 		err               error
 		endHeaders, first bool
 	)
+	// 发送头部，若头部超过默认最大长度，
+	// 则二次发送Continuation帧
 	first = true
 	for !endHeaders {
 		size := l.hBuf.Len()
@@ -667,6 +718,7 @@ func (l *loopyWriter) pingHandler(p *ping) error {
 	return l.framer.fr.WritePing(p.ack, p.data)
 }
 
+// 主要是记录指标用
 func (l *loopyWriter) outFlowControlSizeRequestHandler(o *outFlowControlSizeRequest) error {
 	o.resp <- l.sendQuota
 	return nil
@@ -716,38 +768,7 @@ func (l *loopyWriter) goAwayHandler(g *goAway) error {
 	return nil
 }
 
-// 根据buf item的类型，选择不同的处理函数
-func (l *loopyWriter) handle(i interface{}) error {
-	switch i := i.(type) {
-	case *incomingWindowUpdate:
-		return l.incomingWindowUpdateHandler(i)
-	case *outgoingWindowUpdate:
-		return l.outgoingWindowUpdateHandler(i)
-	case *incomingSettings:
-		return l.incomingSettingsHandler(i)
-	case *outgoingSettings:
-		return l.outgoingSettingsHandler(i)
-	case *headerFrame:
-		return l.headerHandler(i)
-	case *registerStream:
-		return l.registerStreamHandler(i)
-	case *cleanupStream:
-		return l.cleanupStreamHandler(i)
-	case *incomingGoAway:
-		return l.incomingGoAwayHandler(i)
-	case *dataFrame:
-		return l.preprocessData(i)
-	case *ping:
-		return l.pingHandler(i)
-	case *goAway:
-		return l.goAwayHandler(i)
-	case *outFlowControlSizeRequest:
-		return l.outFlowControlSizeRequestHandler(i)
-	default:
-		return fmt.Errorf("transport: unknown control message type %T", i)
-	}
-}
-
+// 应用setting帧
 func (l *loopyWriter) applySettings(ss []http2.Setting) error {
 	for _, s := range ss {
 		switch s.ID {
@@ -755,7 +776,7 @@ func (l *loopyWriter) applySettings(ss []http2.Setting) error {
 			o := l.oiws
 			l.oiws = s.Val
 			if o < l.oiws {
-				// If the new limit is greater make all depleted streams active.
+				// 如果窗口大小变大，则激活waitingOnStreamQuota状态的stream
 				for _, stream := range l.estdStreams {
 					if stream.state == waitingOnStreamQuota {
 						stream.state = active
@@ -862,7 +883,7 @@ func (l *loopyWriter) processData() (bool, error) {
 	dataItem.h = dataItem.h[hSize:]
 	dataItem.d = dataItem.d[dSize:]
 	if len(dataItem.h) == 0 && len(dataItem.d) == 0 {
-		// All the data from that message was written out.
+		// 若data已经发送完成，则将此data帧移除
 		str.itl.dequeue()
 	}
 	if str.itl.isEmpty() {
@@ -875,10 +896,10 @@ func (l *loopyWriter) processData() (bool, error) {
 			return false, err
 		}
 	} else if int(l.oiws)-str.bytesOutStanding <= 0 {
-		// Ran out of stream quota.
+		// 发送配额不够了，进入等待配额状态
 		str.state = waitingOnStreamQuota
 	} else {
-		// Otherwise add it back to the list of active streams.
+		// 否则加入到activeStream尾部
 		l.activeStreams.enqueue(str)
 	}
 	return false, nil
