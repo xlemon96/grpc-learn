@@ -97,25 +97,15 @@ func (f *trInFlow) getSize() uint32 {
 	return atomic.LoadUint32(&f.effectiveWindowSize)
 }
 
-// TODO(mmukhi): Simplify this code.
-// inFlow deals with inbound flow control
 type inFlow struct {
-	mu sync.Mutex
-	// The inbound flow control limit for pending data.
-	limit uint32
-	// pendingData is the overall data which have been received but not been
-	// consumed by applications.
-	pendingData uint32
-	// The amount of data the application has consumed but grpc has not sent
-	// window update for them. Used to reduce window update frequency.
-	pendingUpdate uint32
-	// delta is the extra window update given by receiver when an application
-	// is reading data bigger in size than the inFlow limit.
-	delta uint32
+	mu            sync.Mutex // 锁
+	limit         uint32     // 已经接受但是还没有发送响应的的数据
+	pendingData   uint32     // 收到的数据，但是还没有处理
+	pendingUpdate uint32     // app已经消费但是还没有发送更新窗口，用以降低更新频率
+	delta         uint32     // 当接受者接受的数据大于limit需要此参数
 }
 
-// newLimit updates the inflow window to a new value n.
-// It assumes that n is always greater than the old limit.
+// 更新limit，假设n永远大于limit并返回差值
 func (f *inFlow) newLimit(n uint32) uint32 {
 	f.mu.Lock()
 	d := n - f.limit
@@ -130,9 +120,7 @@ func (f *inFlow) maybeAdjust(n uint32) uint32 {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// estSenderQuota is the receiver's view of the maximum number of bytes the sender
-	// can send without a window update.
-	estSenderQuota := int32(f.limit - (f.pendingData + f.pendingUpdate))
+	estSenderQuota := int32(f.limit - (f.pendingData + f.pendingUpdate)) // 所有还未发送窗口更新的数据(包括处于pending状态的数据)
 	// estUntransmittedData is the maximum number of bytes the sends might not have put
 	// on the wire yet. A value of 0 or less means that we have already received all or
 	// more bytes than the application is requesting to read.
@@ -155,22 +143,21 @@ func (f *inFlow) maybeAdjust(n uint32) uint32 {
 	return 0
 }
 
-// onData is invoked when some data frame is received. It updates pendingData.
+// 接收到数据，则调用onData函数
 func (f *inFlow) onData(n uint32) error {
 	f.mu.Lock()
 	f.pendingData += n
 	if f.pendingData+f.pendingUpdate > f.limit+f.delta {
 		limit := f.limit
-		rcvd := f.pendingData + f.pendingUpdate
+		r := f.pendingData + f.pendingUpdate
 		f.mu.Unlock()
-		return fmt.Errorf("received %d-bytes data exceeding the limit %d bytes", rcvd, limit)
+		return fmt.Errorf("received %d-bytes data exceeding the limit %d bytes", r, limit)
 	}
 	f.mu.Unlock()
 	return nil
 }
 
-// onRead is invoked when the application reads the data. It returns the window size
-// to be sent to the peer.
+// 当应用读取走数据调用onRead函数
 func (f *inFlow) onRead(n uint32) uint32 {
 	f.mu.Lock()
 	if f.pendingData == 0 {

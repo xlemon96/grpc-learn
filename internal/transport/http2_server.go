@@ -20,62 +20,56 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/internal/channelz"
 	"google.golang.org/grpc/internal/grpcrand"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
-	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
 )
 
+const (
+	maxPingStrikes     = 2
+	defaultPingTimeout = 2 * time.Hour
+)
+
 var (
-	// ErrIllegalHeaderWrite indicates that setting header is illegal because of
-	// the stream's state.
+	// 因为stream状态导致的设置header状态异常
 	ErrIllegalHeaderWrite = errors.New("transport: the stream is done or WriteHeader was already called")
-	// ErrHeaderListSizeLimitViolation indicates that the header list size is larger
-	// than the limit set by peer.
+	// header list size is larger than the limit set by peer.
 	ErrHeaderListSizeLimitViolation = errors.New("transport: trying to send header list size larger than the limit set by peer")
 )
 
 var serverConnectionCounter uint64
 
+var goAwayPing = &ping{data: [8]byte{1, 6, 1, 8, 0, 3, 3, 9}}
+
 type http2Server struct {
-	lastRead    int64           // 最后一次读到二进制帧的时间
-	ctx         context.Context // ctx
-	done        chan struct{}   // 是否已经结束
-	conn        net.Conn        // 对应的tcp连接
-	loopy       *loopyWriter
-	readerDone  chan struct{}        // sync point to enable testing.
-	writerDone  chan struct{}        // sync point to enable testing.
-	remoteAddr  net.Addr             // 对端地址
-	localAddr   net.Addr             // 本地地址
-	maxStreamID uint32               // 最大的stream_id
-	authInfo    credentials.AuthInfo // 鉴权信息
-	inTapHandle tap.ServerInHandle   // 操作header时候会调用
-	framer      *framer              // 二进制帧读取器
-	maxStreams  uint32               // 最大的并发流的个数
-	controlBuf  *controlBuffer
-	fc          *trInFlow // 流控
-	stats       stats.Handler
-	// Keepalive and max-age parameters for the server.
-	kp keepalive.ServerParameters
-	// Keepalive enforcement policy.
-	kep        keepalive.EnforcementPolicy
-	lastPingAt time.Time // 最后一次ping的时间
-	// Number of times the client has violated keepalive ping policy so far.
-	pingStrikes uint8
-	// Flag to signify that number of ping strikes should be reset to 0.
-	// This is set whenever data or header frames are sent.
-	// 1 means yes.
-	resetPingStrikes      uint32 // Accessed atomically.
-	initialWindowSize     int32
-	bdpEst                *bdpEstimator
-	maxSendHeaderListSize *uint32
-
-	mu sync.Mutex // guard the following
-
+	lastRead              int64                       // 最后一次读到二进制帧的时间
+	ctx                   context.Context             // ctx
+	done                  chan struct{}               // 是否已经结束
+	conn                  net.Conn                    // 对应的tcp连接
+	loopy                 *loopyWriter                // 发送帧循环
+	readerDone            chan struct{}               // sync point to enable testing.
+	writerDone            chan struct{}               // sync point to enable testing.
+	remoteAddr            net.Addr                    // 对端地址
+	localAddr             net.Addr                    // 本地地址
+	maxStreamID           uint32                      // 最大的stream_id
+	authInfo              credentials.AuthInfo        // 鉴权信息
+	inTapHandle           tap.ServerInHandle          // 操作header时候会调用
+	framer                *framer                     // 二进制帧读取器
+	maxStreams            uint32                      // 最大的并发流的个数
+	controlBuf            *controlBuffer              // 存储二进制帧的地方(跟loopyWriter配合使用)
+	fc                    *trInFlow                   // 流控
+	kp                    keepalive.ServerParameters  // 保活参数
+	kep                   keepalive.EnforcementPolicy // 保活策略
+	lastPingAt            time.Time                   // 最后一次ping的时间
+	pingStrikes           uint8                       // 客户端违背保活策略的次数
+	resetPingStrikes      uint32                      // 是否需要被重置，当有数据发送的时候设置
+	initialWindowSize     int32                       // 初始化窗口大小
+	bdpEst                *bdpEstimator               // ？？？？？？
+	maxSendHeaderListSize *uint32                     // 最大的头部发送列表长度
+	mu                    sync.Mutex                  // guard the following
 	// drainChan is initialized when drain(...) is called the first time.
 	// After which the server writes out the first GoAway(with ID 2^31-1) frame.
 	// Then an independent goroutine will be launched to later send the second GoAway.
@@ -83,20 +77,11 @@ type http2Server struct {
 	// Thus call to drain(...) will be a no-op if drainChan is already initialized since draining is
 	// already underway.
 	drainChan     chan struct{}
-	state         transportState
-	activeStreams map[uint32]*Stream
-	// idle is the time instant when the connection went idle.
-	// This is either the beginning of the connection or when the number of
-	// RPCs go down to 0.
-	// When the connection is busy, this value is set to 0.
-	idle time.Time
-
-	// Fields below are for channelz metric collection.
-	channelzID int64 // channelz unique identification number
-	czData     *channelzData
-	bufferPool *bufferPool
-
-	connectionID uint64
+	state         transportState     // transport状态
+	activeStreams map[uint32]*Stream // 活动的stream
+	idle          time.Time          // connection空闲时间
+	bufferPool    *bufferPool        // bufferPool
+	connectionID  uint64             // 连接id
 }
 
 // 初始化一个http2服务器
@@ -108,18 +93,16 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 		maxHeaderListSize = *config.MaxHeaderListSize
 	}
 	framer := newFramer(conn, writeBufSize, readBufSize, maxHeaderListSize)
-	// Send initial settings as connection preface to client.
-	isettings := []http2.Setting{{
+	// 发送setting帧给客户端
+	settings := []http2.Setting{{
 		ID:  http2.SettingMaxFrameSize,
 		Val: http2MaxFrameLen,
 	}}
-	// TODO(zhaoq): Have a better way to signal "no limit" because 0 is
-	// permitted in the HTTP2 spec.
 	maxStreams := config.MaxStreams
 	if maxStreams == 0 {
 		maxStreams = math.MaxUint32
 	} else {
-		isettings = append(isettings, http2.Setting{
+		settings = append(settings, http2.Setting{
 			ID:  http2.SettingMaxConcurrentStreams,
 			Val: maxStreams,
 		})
@@ -136,23 +119,24 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 		dynamicWindow = false
 	}
 	if iwz != defaultWindowSize {
-		isettings = append(isettings, http2.Setting{
+		settings = append(settings, http2.Setting{
 			ID:  http2.SettingInitialWindowSize,
 			Val: uint32(iwz)})
 	}
 	if config.MaxHeaderListSize != nil {
-		isettings = append(isettings, http2.Setting{
+		settings = append(settings, http2.Setting{
 			ID:  http2.SettingMaxHeaderListSize,
 			Val: *config.MaxHeaderListSize,
 		})
 	}
 	if config.HeaderTableSize != nil {
-		isettings = append(isettings, http2.Setting{
+		settings = append(settings, http2.Setting{
 			ID:  http2.SettingHeaderTableSize,
 			Val: *config.HeaderTableSize,
 		})
 	}
-	if err := framer.fr.WriteSettings(isettings...); err != nil {
+	// 发送setting帧
+	if err := framer.fr.WriteSettings(settings...); err != nil {
 		return nil, connectionErrorf(false, err, "transport: %v", err)
 	}
 	// Adjust the connection flow control window if needed.
@@ -168,7 +152,6 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 	if kp.MaxConnectionAge == 0 {
 		kp.MaxConnectionAge = defaultMaxConnectionAge
 	}
-	// Add a jitter to MaxConnectionAge.
 	kp.MaxConnectionAge += getJitter(kp.MaxConnectionAge)
 	if kp.MaxConnectionAgeGrace == 0 {
 		kp.MaxConnectionAgeGrace = defaultMaxConnectionAgeGrace
@@ -199,12 +182,10 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 		fc:                &trInFlow{limit: uint32(icwz)},
 		state:             reachable,
 		activeStreams:     make(map[uint32]*Stream),
-		stats:             config.StatsHandler,
 		kp:                kp,
 		idle:              time.Now(),
 		kep:               kep,
 		initialWindowSize: iwz,
-		czData:            new(channelzData),
 		bufferPool:        newBufferPool(),
 	}
 	t.controlBuf = newControlBuffer(t.done)
@@ -214,28 +195,13 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 			updateFlowControl: t.updateFlowControl,
 		}
 	}
-	if t.stats != nil {
-		t.ctx = t.stats.TagConn(t.ctx, &stats.ConnTagInfo{
-			RemoteAddr: t.remoteAddr,
-			LocalAddr:  t.localAddr,
-		})
-		connBegin := &stats.ConnBegin{}
-		t.stats.HandleConn(t.ctx, connBegin)
-	}
-	if channelz.IsOn() {
-		t.channelzID = channelz.RegisterNormalSocket(t, config.ChannelzParentID, fmt.Sprintf("%s -> %s", t.remoteAddr, t.localAddr))
-	}
-
 	t.connectionID = atomic.AddUint64(&serverConnectionCounter, 1)
-
 	t.framer.writer.Flush()
-
 	defer func() {
 		if err != nil {
 			t.Close()
 		}
 	}()
-
 	// Check the validity of client preface.
 	preface := make([]byte, len(clientPreface))
 	if _, err := io.ReadFull(t.conn, preface); err != nil {
@@ -244,7 +210,6 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 	if !bytes.Equal(preface, clientPreface) {
 		return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
 	}
-
 	frame, err := t.framer.fr.ReadFrame()
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
 		return nil, err
@@ -258,7 +223,6 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 		return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
 	}
 	t.handleSettings(sf)
-
 	go func() {
 		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst)
 		t.loopy.ssGoAwayHandler = t.outgoingGoAwayHandler
@@ -284,6 +248,8 @@ func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.
 		// 更新最后一次读取frame的时间
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		if err != nil {
+			// 若为stream异常
+			// 则关闭对应流
 			if se, ok := err.(http2.StreamError); ok {
 				if logger.V(logLevel) {
 					logger.Warningf("transport: http2Server.HandleStreams encountered http2.StreamError: %v", se)
@@ -303,6 +269,7 @@ func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.
 				}
 				continue
 			}
+			// 若非stream异常，直接关闭服务器
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				t.Close()
 				return
@@ -345,6 +312,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	state := &decodeState{
 		serverSide: true,
 	}
+	// 解码头部
 	if err := state.decodeHeader(frame); err != nil {
 		if se, ok := status.FromError(err); ok {
 			t.controlBuf.put(&cleanupStream{
@@ -369,6 +337,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	if frame.StreamEnded() {
 		s.state = streamReadDone
 	}
+	// 是否设置超时时间
 	if state.data.timeoutSet {
 		s.ctx, s.cancel = context.WithTimeout(t.ctx, state.data.timeout)
 	} else {
@@ -384,12 +353,12 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	if len(state.data.mdata) > 0 {
 		s.ctx = metadata.NewIncomingContext(s.ctx, state.data.mdata)
 	}
-	if state.data.statsTags != nil {
-		s.ctx = stats.SetIncomingTags(s.ctx, state.data.statsTags)
-	}
-	if state.data.statsTrace != nil {
-		s.ctx = stats.SetIncomingTrace(s.ctx, state.data.statsTrace)
-	}
+	//if state.data.statsTags != nil {
+	//	s.ctx = stats.SetIncomingTags(s.ctx, state.data.statsTags)
+	//}
+	//if state.data.statsTrace != nil {
+	//	s.ctx = stats.SetIncomingTrace(s.ctx, state.data.statsTrace)
+	//}
 	if t.inTapHandle != nil {
 		var err error
 		info := &tap.Info{
@@ -441,26 +410,10 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		t.idle = time.Time{}
 	}
 	t.mu.Unlock()
-	if channelz.IsOn() {
-		atomic.AddInt64(&t.czData.streamsStarted, 1)
-		atomic.StoreInt64(&t.czData.lastStreamCreatedTime, time.Now().UnixNano())
-	}
 	s.requestRead = func(n int) {
 		t.adjustWindow(s, uint32(n))
 	}
 	s.ctx = traceCtx(s.ctx, s.method)
-	if t.stats != nil {
-		s.ctx = t.stats.TagRPC(s.ctx, &stats.RPCTagInfo{FullMethodName: s.method})
-		inHeader := &stats.InHeader{
-			FullMethod:  s.method,
-			RemoteAddr:  t.remoteAddr,
-			LocalAddr:   t.localAddr,
-			Compression: s.recvCompress,
-			WireLength:  int(frame.Header().Length),
-			Header:      metadata.MD(state.data.mdata).Copy(),
-		}
-		t.stats.HandleRPC(s.ctx, inHeader)
-	}
 	s.ctxDone = s.ctx.Done()
 	s.wq = newWriteQuota(defaultWriteQuota, s.ctxDone)
 	s.trReader = &transportReader{
@@ -482,31 +435,6 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	return false
 }
 
-func (t *http2Server) getStream(f http2.Frame) (*Stream, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.activeStreams == nil {
-		// The transport is closing.
-		return nil, false
-	}
-	s, ok := t.activeStreams[f.Header().StreamID]
-	if !ok {
-		// The stream is already done.
-		return nil, false
-	}
-	return s, true
-}
-
-// adjustWindow sends out extra window update over the initial window size
-// of stream if the application is requesting data larger in size than
-// the window.
-func (t *http2Server) adjustWindow(s *Stream, n uint32) {
-	if w := s.fc.maybeAdjust(n); w > 0 {
-		t.controlBuf.put(&outgoingWindowUpdate{streamID: s.id, increment: w})
-	}
-
-}
-
 // 告知发送端接受配额可以更新
 // 主要针对data数据帧，用作流控(连接或者stream级别均可)
 func (t *http2Server) updateWindow(s *Stream, n uint32) {
@@ -517,9 +445,7 @@ func (t *http2Server) updateWindow(s *Stream, n uint32) {
 	}
 }
 
-// updateFlowControl updates the incoming flow control windows
-// for the transport and the stream based on the current bdp
-// estimation.
+// 依据bdp决定是否需要更新输入流流控窗口
 func (t *http2Server) updateFlowControl(n uint32) {
 	t.mu.Lock()
 	for _, s := range t.activeStreams {
@@ -539,23 +465,16 @@ func (t *http2Server) updateFlowControl(n uint32) {
 			},
 		},
 	})
-
 }
 
+// 数据帧处理函数
 func (t *http2Server) handleData(f *http2.DataFrame) {
 	size := f.Header().Length
 	var sendBDPPing bool
 	if t.bdpEst != nil {
 		sendBDPPing = t.bdpEst.add(size)
 	}
-	// Decouple connection's flow control from application's read.
-	// An update on connection's flow control should not depend on
-	// whether user application has read the data or not. Such a
-	// restriction is already imposed on the stream's flow control,
-	// and therefore the sender will be blocked anyways.
-	// Decoupling the connection flow control will prevent other
-	// active(fast) streams from starving in presence of slow or
-	// inactive streams.
+	// 若可以处理此data，则发送窗口更新帧
 	if w := t.fc.onData(size); w > 0 {
 		t.controlBuf.put(&outgoingWindowUpdate{
 			streamID:  0,
@@ -573,7 +492,6 @@ func (t *http2Server) handleData(f *http2.DataFrame) {
 		}
 		t.controlBuf.put(bdpPing)
 	}
-	// Select the right stream to dispatch.
 	s, ok := t.getStream(f)
 	if !ok {
 		return
@@ -588,9 +506,6 @@ func (t *http2Server) handleData(f *http2.DataFrame) {
 				t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
 			}
 		}
-		// TODO(bradfitz, zhaoq): A copy is required here because there is no
-		// guarantee f.Data() is consumed before the arrival of next frame.
-		// Can this copy be eliminated?
 		if len(f.Data()) > 0 {
 			buffer := t.bufferPool.get()
 			buffer.Reset()
@@ -599,7 +514,6 @@ func (t *http2Server) handleData(f *http2.DataFrame) {
 		}
 	}
 	if f.Header().Flags.Has(http2.FlagDataEndStream) {
-		// Received the end of stream from the client.
 		s.compareAndSwapState(streamActive, streamReadDone)
 		s.write(recvMsg{err: io.EOF})
 	}
@@ -648,18 +562,14 @@ func (t *http2Server) handleSettings(f *http2.SettingsFrame) {
 	})
 }
 
-const (
-	maxPingStrikes     = 2
-	defaultPingTimeout = 2 * time.Hour
-)
-
 func (t *http2Server) handlePing(f *http2.PingFrame) {
+	// 如果是ack，则代表是客户端响应服务器的ack报文
 	if f.IsAck() {
 		if f.Data == goAwayPing.data && t.drainChan != nil {
 			close(t.drainChan)
 			return
 		}
-		// Maybe it's a BDP ping.
+		// 有可能是BDP的ping报文
 		if t.bdpEst != nil {
 			t.bdpEst.calculate(f.Data)
 		}
@@ -668,7 +578,6 @@ func (t *http2Server) handlePing(f *http2.PingFrame) {
 	pingAck := &ping{ack: true}
 	copy(pingAck.data[:], f.Data[:])
 	t.controlBuf.put(pingAck)
-
 	now := time.Now()
 	defer func() {
 		t.lastPingAt = now
@@ -742,7 +651,6 @@ func (t *http2Server) checkForHeaderListSize(it interface{}) bool {
 	return true
 }
 
-// WriteHeader sends the header metadata md back to the client.
 func (t *http2Server) WriteHeader(s *Stream, md metadata.MD) error {
 	if s.updateHeaderSent() || s.getState() == streamDone {
 		return ErrIllegalHeaderWrite
@@ -790,22 +698,9 @@ func (t *http2Server) writeHeaderLocked(s *Stream) error {
 		t.closeStream(s, true, http2.ErrCodeInternal, false)
 		return ErrHeaderListSizeLimitViolation
 	}
-	if t.stats != nil {
-		// Note: Headers are compressed with hpack after this call returns.
-		// No WireLength field is set here.
-		outHeader := &stats.OutHeader{
-			Header:      s.header.Copy(),
-			Compression: s.sendCompress,
-		}
-		t.stats.HandleRPC(s.Context(), outHeader)
-	}
 	return nil
 }
 
-// WriteStatus sends stream status to the client and terminates the stream.
-// There is no further I/O operations being able to perform on this stream.
-// TODO(zhaoq): Now it indicates the end of entire stream. Revisit if early
-// OK is adopted.
 func (t *http2Server) WriteStatus(s *Stream, st *status.Status) error {
 	if s.getState() == streamDone {
 		return nil
@@ -858,13 +753,6 @@ func (t *http2Server) WriteStatus(s *Stream, st *status.Status) error {
 	// Send a RST_STREAM after the trailers if the client has not already half-closed.
 	rst := s.getState() == streamActive
 	t.finishStream(s, rst, http2.ErrCodeNo, trailingHeader, true)
-	if t.stats != nil {
-		// Note: The trailer fields are compressed with hpack after this call returns.
-		// No WireLength field is set here.
-		t.stats.HandleRPC(s.Context(), &stats.OutTrailer{
-			Trailer: s.trailer.Copy(),
-		})
-	}
 	return nil
 }
 
@@ -989,9 +877,6 @@ func (t *http2Server) keepalive() {
 				return
 			}
 			if !outstandingPing {
-				if channelz.IsOn() {
-					atomic.AddInt64(&t.czData.kpCount, 1)
-				}
 				t.controlBuf.put(p)
 				kpTimeoutLeft = t.kp.Timeout
 				outstandingPing = true
@@ -1009,9 +894,6 @@ func (t *http2Server) keepalive() {
 	}
 }
 
-// Close starts shutting down the http2Server transport.
-// TODO(zhaoq): Now the destruction is not blocked on any pending streams. This
-// could cause some resource issue. Revisit this later.
 func (t *http2Server) Close() error {
 	t.mu.Lock()
 	if t.state == closing {
@@ -1025,16 +907,8 @@ func (t *http2Server) Close() error {
 	t.controlBuf.finish()
 	close(t.done)
 	err := t.conn.Close()
-	if channelz.IsOn() {
-		channelz.RemoveEntry(t.channelzID)
-	}
-	// Cancel all active streams.
 	for _, s := range streams {
 		s.cancel()
-	}
-	if t.stats != nil {
-		connEnd := &stats.ConnEnd{}
-		t.stats.HandleConn(t.ctx, connEnd)
 	}
 	return err
 }
@@ -1054,14 +928,6 @@ func (t *http2Server) deleteStream(s *Stream, eosReceived bool) {
 		}
 	}
 	t.mu.Unlock()
-
-	if channelz.IsOn() {
-		if eosReceived {
-			atomic.AddInt64(&t.czData.streamsSucceeded, 1)
-		} else {
-			atomic.AddInt64(&t.czData.streamsFailed, 1)
-		}
-	}
 }
 
 // finishStream closes the stream and puts the trailing headerFrame into controlbuf.
@@ -1114,20 +980,15 @@ func (t *http2Server) drain(code http2.ErrCode, debugData []byte) {
 	t.controlBuf.put(&goAway{code: code, debugData: debugData, headsUp: true})
 }
 
-var goAwayPing = &ping{data: [8]byte{1, 6, 1, 8, 0, 3, 3, 9}}
-
-// Handles outgoing GoAway and returns true if loopy needs to put itself
-// in draining mode.
 func (t *http2Server) outgoingGoAwayHandler(g *goAway) (bool, error) {
 	t.mu.Lock()
-	if t.state == closing { // TODO(mmukhi): This seems unnecessary.
+	if t.state == closing {
 		t.mu.Unlock()
-		// The transport is closing.
 		return false, ErrConnClosing
 	}
 	sid := t.maxStreamID
 	if !g.headsUp {
-		// Stop accepting more streams now.
+		// 停止接受更多的流
 		t.state = draining
 		if len(t.activeStreams) == 0 {
 			g.closeConn = true
@@ -1171,40 +1032,7 @@ func (t *http2Server) outgoingGoAwayHandler(g *goAway) (bool, error) {
 	return false, nil
 }
 
-func (t *http2Server) ChannelzMetric() *channelz.SocketInternalMetric {
-	s := channelz.SocketInternalMetric{
-		StreamsStarted:                   atomic.LoadInt64(&t.czData.streamsStarted),
-		StreamsSucceeded:                 atomic.LoadInt64(&t.czData.streamsSucceeded),
-		StreamsFailed:                    atomic.LoadInt64(&t.czData.streamsFailed),
-		MessagesSent:                     atomic.LoadInt64(&t.czData.msgSent),
-		MessagesReceived:                 atomic.LoadInt64(&t.czData.msgRecv),
-		KeepAlivesSent:                   atomic.LoadInt64(&t.czData.kpCount),
-		LastRemoteStreamCreatedTimestamp: time.Unix(0, atomic.LoadInt64(&t.czData.lastStreamCreatedTime)),
-		LastMessageSentTimestamp:         time.Unix(0, atomic.LoadInt64(&t.czData.lastMsgSentTime)),
-		LastMessageReceivedTimestamp:     time.Unix(0, atomic.LoadInt64(&t.czData.lastMsgRecvTime)),
-		LocalFlowControlWindow:           int64(t.fc.getSize()),
-		SocketOptions:                    channelz.GetSocketOption(t.conn),
-		LocalAddr:                        t.localAddr,
-		RemoteAddr:                       t.remoteAddr,
-		// RemoteName :
-	}
-	if au, ok := t.authInfo.(credentials.ChannelzSecurityInfo); ok {
-		s.Security = au.GetSecurityValue()
-	}
-	s.RemoteFlowControlWindow = t.getOutFlowWindow()
-	return &s
-}
-
-func (t *http2Server) IncrMsgSent() {
-	atomic.AddInt64(&t.czData.msgSent, 1)
-	atomic.StoreInt64(&t.czData.lastMsgSentTime, time.Now().UnixNano())
-}
-
-func (t *http2Server) IncrMsgRecv() {
-	atomic.AddInt64(&t.czData.msgRecv, 1)
-	atomic.StoreInt64(&t.czData.lastMsgRecvTime, time.Now().UnixNano())
-}
-
+// 获取此时的发送配额
 func (t *http2Server) getOutFlowWindow() int64 {
 	resp := make(chan uint32, 1)
 	timer := time.NewTimer(time.Second)
@@ -1217,6 +1045,28 @@ func (t *http2Server) getOutFlowWindow() int64 {
 		return -1
 	case <-timer.C:
 		return -2
+	}
+}
+
+func (t *http2Server) getStream(f http2.Frame) (*Stream, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.activeStreams == nil {
+		return nil, false
+	}
+	s, ok := t.activeStreams[f.Header().StreamID]
+	if !ok {
+		return nil, false
+	}
+	return s, true
+}
+
+// adjustWindow sends out extra window update over the initial window size
+// of stream if the application is requesting data larger in size than
+// the window.
+func (t *http2Server) adjustWindow(s *Stream, n uint32) {
+	if w := s.fc.maybeAdjust(n); w > 0 {
+		t.controlBuf.put(&outgoingWindowUpdate{streamID: s.id, increment: w})
 	}
 }
 

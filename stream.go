@@ -1,21 +1,3 @@
-/*
- *
- * Copyright 2014 gRPC authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- */
-
 package grpc
 
 import (
@@ -43,43 +25,24 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// StreamHandler defines the handler called by gRPC server to complete the
-// execution of a streaming RPC. If a StreamHandler returns an error, it
-// should be produced by the status package, or else gRPC will use
-// codes.Unknown as the status code and err.Error() as the status message
-// of the RPC.
 type StreamHandler func(srv interface{}, stream ServerStream) error
 
-// StreamDesc represents a streaming RPC service's method specification.
 type StreamDesc struct {
-	StreamName string
-	Handler    StreamHandler
-
-	// At least one of these is true.
+	StreamName    string
+	Handler       StreamHandler
 	ServerStreams bool
 	ClientStreams bool
 }
 
-// Stream defines the common interface a client or server stream has to satisfy.
-//
-// Deprecated: See ClientStream and ServerStream documentation instead.
 type Stream interface {
-	// Deprecated: See ClientStream and ServerStream documentation instead.
 	Context() context.Context
-	// Deprecated: See ClientStream and ServerStream documentation instead.
 	SendMsg(m interface{}) error
-	// Deprecated: See ClientStream and ServerStream documentation instead.
 	RecvMsg(m interface{}) error
 }
 
-// ClientStream defines the client-side behavior of a streaming RPC.
-//
-// All errors returned from ClientStream methods are compatible with the
-// status package.
+// 客户端stream
 type ClientStream interface {
-	// Header returns the header metadata received from the server if there
-	// is any. It blocks if the metadata is not ready to read.
-	Header() (metadata.MD, error)
+	Header() (metadata.MD, error) // 获取服务端发送过来的header
 	// Trailer returns the trailer metadata from the server, if there is any.
 	// It must only be called after stream.CloseAndRecv has returned, or
 	// stream.Recv has returned a non-nil error (including io.EOF).
@@ -324,66 +287,6 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 		}()
 	}
 	return cs, nil
-}
-
-// newAttemptLocked creates a new attempt with a transport.
-// If it succeeds, then it replaces clientStream's attempt with this new attempt.
-func (cs *clientStream) newAttemptLocked(sh stats.Handler, trInfo *traceInfo) (retErr error) {
-	newAttempt := &csAttempt{
-		cs:           cs,
-		dc:           cs.cc.dopts.dc,
-		statsHandler: sh,
-		trInfo:       trInfo,
-	}
-	defer func() {
-		if retErr != nil {
-			// This attempt is not set in the clientStream, so it's finish won't
-			// be called. Call it here for stats and trace in case they are not
-			// nil.
-			newAttempt.finish(retErr)
-		}
-	}()
-
-	if err := cs.ctx.Err(); err != nil {
-		return toRPCErr(err)
-	}
-
-	ctx := cs.ctx
-	if cs.cc.parsedTarget.Scheme == "xds" {
-		// Add extra metadata (metadata that will be added by transport) to context
-		// so the balancer can see them.
-		ctx = grpcutil.WithExtraMetadata(cs.ctx, metadata.Pairs(
-			"content-type", grpcutil.ContentType(cs.callHdr.ContentSubtype),
-		))
-	}
-	t, done, err := cs.cc.getTransport(ctx, cs.callInfo.failFast, cs.callHdr.Method)
-	if err != nil {
-		return err
-	}
-	if trInfo != nil {
-		trInfo.firstLine.SetRemoteAddr(t.RemoteAddr())
-	}
-	newAttempt.t = t
-	newAttempt.done = done
-	cs.attempt = newAttempt
-	return nil
-}
-
-func (a *csAttempt) newStream() error {
-	cs := a.cs
-	cs.callHdr.PreviousAttempts = cs.numRetries
-	s, err := a.t.NewStream(cs.ctx, cs.callHdr)
-	if err != nil {
-		if _, ok := err.(transport.PerformedIOError); ok {
-			// Return without converting to an RPC error so retry code can
-			// inspect.
-			return err
-		}
-		return toRPCErr(err)
-	}
-	cs.attempt.s = s
-	cs.attempt.p = &parser{r: s}
-	return nil
 }
 
 // clientStream implements a client side Stream.
@@ -854,6 +757,66 @@ func (cs *clientStream) finish(err error) {
 		}
 	}
 	cs.cancel()
+}
+
+// newAttemptLocked creates a new attempt with a transport.
+// If it succeeds, then it replaces clientStream's attempt with this new attempt.
+func (cs *clientStream) newAttemptLocked(sh stats.Handler, trInfo *traceInfo) (retErr error) {
+	newAttempt := &csAttempt{
+		cs:           cs,
+		dc:           cs.cc.dopts.dc,
+		statsHandler: sh,
+		trInfo:       trInfo,
+	}
+	defer func() {
+		if retErr != nil {
+			// This attempt is not set in the clientStream, so it's finish won't
+			// be called. Call it here for stats and trace in case they are not
+			// nil.
+			newAttempt.finish(retErr)
+		}
+	}()
+
+	if err := cs.ctx.Err(); err != nil {
+		return toRPCErr(err)
+	}
+
+	ctx := cs.ctx
+	if cs.cc.parsedTarget.Scheme == "xds" {
+		// Add extra metadata (metadata that will be added by transport) to context
+		// so the balancer can see them.
+		ctx = grpcutil.WithExtraMetadata(cs.ctx, metadata.Pairs(
+			"content-type", grpcutil.ContentType(cs.callHdr.ContentSubtype),
+		))
+	}
+	t, done, err := cs.cc.getTransport(ctx, cs.callInfo.failFast, cs.callHdr.Method)
+	if err != nil {
+		return err
+	}
+	if trInfo != nil {
+		trInfo.firstLine.SetRemoteAddr(t.RemoteAddr())
+	}
+	newAttempt.t = t
+	newAttempt.done = done
+	cs.attempt = newAttempt
+	return nil
+}
+
+func (a *csAttempt) newStream() error {
+	cs := a.cs
+	cs.callHdr.PreviousAttempts = cs.numRetries
+	s, err := a.t.NewStream(cs.ctx, cs.callHdr)
+	if err != nil {
+		if _, ok := err.(transport.PerformedIOError); ok {
+			// Return without converting to an RPC error so retry code can
+			// inspect.
+			return err
+		}
+		return toRPCErr(err)
+	}
+	cs.attempt.s = s
+	cs.attempt.p = &parser{r: s}
+	return nil
 }
 
 func (a *csAttempt) sendMsg(m interface{}, hdr, payld, data []byte) error {
@@ -1337,35 +1300,15 @@ type ServerStream interface {
 	RecvMsg(m interface{}) error
 }
 
-// serverStream implements a server side Stream.
 type serverStream struct {
-	ctx   context.Context
-	t     transport.ServerTransport
-	s     *transport.Stream
-	p     *parser
-	codec baseCodec
-
-	cp     Compressor
-	dc     Decompressor
-	comp   encoding.Compressor
-	decomp encoding.Compressor
-
-	maxReceiveMessageSize int
-	maxSendMessageSize    int
-	trInfo                *traceInfo
-
-	statsHandler stats.Handler
-
-	binlog *binarylog.MethodLogger
-	// serverHeaderBinlogged indicates whether server header has been logged. It
-	// will happen when one of the following two happens: stream.SendHeader(),
-	// stream.Send().
-	//
-	// It's only checked in send and sendHeader, doesn't need to be
-	// synchronized.
-	serverHeaderBinlogged bool
-
-	mu sync.Mutex // protects trInfo.tr after the service handler runs.
+	ctx                   context.Context           // ctx
+	t                     transport.ServerTransport // transport
+	s                     *transport.Stream         // stream
+	p                     *parser                   // 读取data帧
+	codec                 baseCodec                 // 序列化、反序列化
+	comp                  encoding.Compressor       // 压缩、解压缩
+	maxReceiveMessageSize int                       // 最大的接受消息长度
+	maxSendMessageSize    int                       // 最大的发送消息长度
 }
 
 func (ss *serverStream) Context() context.Context {
@@ -1380,15 +1323,7 @@ func (ss *serverStream) SetHeader(md metadata.MD) error {
 }
 
 func (ss *serverStream) SendHeader(md metadata.MD) error {
-	err := ss.t.WriteHeader(ss.s, md)
-	if ss.binlog != nil && !ss.serverHeaderBinlogged {
-		h, _ := ss.s.Header()
-		ss.binlog.Log(&binarylog.ServerHeader{
-			Header: h,
-		})
-		ss.serverHeaderBinlogged = true
-	}
-	return err
+	return ss.t.WriteHeader(ss.s, md)
 }
 
 func (ss *serverStream) SetTrailer(md metadata.MD) {
@@ -1400,101 +1335,33 @@ func (ss *serverStream) SetTrailer(md metadata.MD) {
 
 func (ss *serverStream) SendMsg(m interface{}) (err error) {
 	defer func() {
-		if ss.trInfo != nil {
-			ss.mu.Lock()
-			if ss.trInfo.tr != nil {
-				if err == nil {
-					ss.trInfo.tr.LazyLog(&payload{sent: true, msg: m}, true)
-				} else {
-					ss.trInfo.tr.LazyLog(&fmtStringer{"%v", []interface{}{err}}, true)
-					ss.trInfo.tr.SetError()
-				}
-			}
-			ss.mu.Unlock()
-		}
 		if err != nil && err != io.EOF {
 			st, _ := status.FromError(toRPCErr(err))
 			ss.t.WriteStatus(ss.s, st)
-			// Non-user specified status was sent out. This should be an error
-			// case (as a server side Cancel maybe).
-			//
-			// This is not handled specifically now. User will return a final
-			// status from the service handler, we will log that error instead.
-			// This behavior is similar to an interceptor.
-		}
-		if channelz.IsOn() && err == nil {
-			ss.t.IncrMsgSent()
 		}
 	}()
-
-	// load hdr, payload, data
-	hdr, payload, data, err := prepareMsg(m, ss.codec, ss.cp, ss.comp)
+	hdr, payload, _, err := prepareMsg(m, ss.codec, ss.comp)
 	if err != nil {
 		return err
 	}
-
-	// TODO(dfawley): should we be checking len(data) instead?
 	if len(payload) > ss.maxSendMessageSize {
 		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payload), ss.maxSendMessageSize)
 	}
 	if err := ss.t.Write(ss.s, hdr, payload, &transport.Options{Last: false}); err != nil {
 		return toRPCErr(err)
 	}
-	if ss.binlog != nil {
-		if !ss.serverHeaderBinlogged {
-			h, _ := ss.s.Header()
-			ss.binlog.Log(&binarylog.ServerHeader{
-				Header: h,
-			})
-			ss.serverHeaderBinlogged = true
-		}
-		ss.binlog.Log(&binarylog.ServerMessage{
-			Message: data,
-		})
-	}
-	if ss.statsHandler != nil {
-		ss.statsHandler.HandleRPC(ss.s.Context(), outPayload(false, m, data, payload, time.Now()))
-	}
 	return nil
 }
 
 func (ss *serverStream) RecvMsg(m interface{}) (err error) {
 	defer func() {
-		if ss.trInfo != nil {
-			ss.mu.Lock()
-			if ss.trInfo.tr != nil {
-				if err == nil {
-					ss.trInfo.tr.LazyLog(&payload{sent: false, msg: m}, true)
-				} else if err != io.EOF {
-					ss.trInfo.tr.LazyLog(&fmtStringer{"%v", []interface{}{err}}, true)
-					ss.trInfo.tr.SetError()
-				}
-			}
-			ss.mu.Unlock()
-		}
 		if err != nil && err != io.EOF {
 			st, _ := status.FromError(toRPCErr(err))
 			ss.t.WriteStatus(ss.s, st)
-			// Non-user specified status was sent out. This should be an error
-			// case (as a server side Cancel maybe).
-			//
-			// This is not handled specifically now. User will return a final
-			// status from the service handler, we will log that error instead.
-			// This behavior is similar to an interceptor.
-		}
-		if channelz.IsOn() && err == nil {
-			ss.t.IncrMsgRecv()
 		}
 	}()
-	var payInfo *payloadInfo
-	if ss.statsHandler != nil || ss.binlog != nil {
-		payInfo = &payloadInfo{}
-	}
-	if err := recv(ss.p, ss.codec, ss.s, ss.dc, m, ss.maxReceiveMessageSize, payInfo, ss.decomp); err != nil {
+	if err := recv(ss.p, ss.codec, ss.s, m, ss.maxReceiveMessageSize, ss.comp); err != nil {
 		if err == io.EOF {
-			if ss.binlog != nil {
-				ss.binlog.Log(&binarylog.ClientHalfClose{})
-			}
 			return err
 		}
 		if err == io.ErrUnexpectedEOF {
@@ -1502,44 +1369,25 @@ func (ss *serverStream) RecvMsg(m interface{}) (err error) {
 		}
 		return toRPCErr(err)
 	}
-	if ss.statsHandler != nil {
-		ss.statsHandler.HandleRPC(ss.s.Context(), &stats.InPayload{
-			RecvTime: time.Now(),
-			Payload:  m,
-			// TODO truncate large payload.
-			Data:       payInfo.uncompressedBytes,
-			WireLength: payInfo.wireLength,
-			Length:     len(payInfo.uncompressedBytes),
-		})
-	}
-	if ss.binlog != nil {
-		ss.binlog.Log(&binarylog.ClientMessage{
-			Message: payInfo.uncompressedBytes,
-		})
-	}
 	return nil
 }
 
-// MethodFromServerStream returns the method string for the input stream.
-// The returned string is in the format of "/service/method".
+// 从输入流获取方法名称
+// 格式如下/service/method
 func MethodFromServerStream(stream ServerStream) (string, bool) {
 	return Method(stream.Context())
 }
 
-// prepareMsg returns the hdr, payload and data
-// using the compressors passed or using the
-// passed preparedmsg
-func prepareMsg(m interface{}, codec baseCodec, cp Compressor, comp encoding.Compressor) (hdr, payload, data []byte, err error) {
+// 消息预处理
+func prepareMsg(m interface{}, codec baseCodec, comp encoding.Compressor) (hdr, payload, data []byte, err error) {
 	if preparedMsg, ok := m.(*PreparedMsg); ok {
 		return preparedMsg.hdr, preparedMsg.payload, preparedMsg.encodedData, nil
 	}
-	// The input interface is not a prepared msg.
-	// Marshal and Compress the data at this point
 	data, err = encode(codec, m)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	compData, err := compress(data, cp, comp)
+	compData, err := compress(data, comp)
 	if err != nil {
 		return nil, nil, nil, err
 	}

@@ -15,12 +15,28 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/resolver"
-	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
 )
 
 const logLevel = 2
+
+type streamState uint32
+
+const (
+	streamActive    streamState = iota
+	streamWriteDone             // 停止写
+	streamReadDone              // 停止读
+	streamDone                  // 流结束
+)
+
+type transportState int
+
+const (
+	reachable transportState = iota
+	closing
+	draining
+)
 
 type bufferPool struct {
 	pool sync.Pool
@@ -110,11 +126,11 @@ func (b *recvBuffer) get() <-chan recvMsg {
 }
 
 type recvBufferReader struct {
-	closeStream func(error) // Closes the client transport stream with the given error and nil trailer metadata.
-	ctx         context.Context
+	closeStream func(error)     // 用给定的err和nil trailer metadata关闭client transport stream
+	ctx         context.Context // ctx
 	ctxDone     <-chan struct{} // cache of ctx.Done() (for performance).
-	recv        *recvBuffer
-	last        *bytes.Buffer // Stores the remaining data in the previous calls.
+	recv        *recvBuffer     // recvBuffer
+	last        *bytes.Buffer   // 缓存之前调用留下的数据
 	err         error
 	freeBuffer  func(*bytes.Buffer)
 }
@@ -191,70 +207,36 @@ func (r *recvBufferReader) readAdditional(m recvMsg, p []byte) (n int, err error
 	return copied, nil
 }
 
-type streamState uint32
-
-const (
-	streamActive    streamState = iota
-	streamWriteDone             // 写的EndStream已经发送
-	streamReadDone              // 读的EndStream已经发送
-	streamDone                  // 流结束
-)
-
-// Stream represents an RPC in the transport layer.
 // 代表了一次rpc访问
 type Stream struct {
-	id           uint32             // 流的标识符
-	st           ServerTransport    // 对于client来说为nil
-	ct           *http2Client       // 对于server来说为nil
-	ctx          context.Context    // 流关联的ctx
-	cancel       context.CancelFunc // 对于客户端来说为nil
-	done         chan struct{}      // closed at the end of stream to unblock writers. On the client side.
-	ctxDone      <-chan struct{}    // same as done chan but for server side. Cache of ctx.Done() (for performance)
-	method       string             // the associated RPC method of the stream
-	recvCompress string
-	sendCompress string
-	buf          *recvBuffer
-	trReader     io.Reader
-	fc           *inFlow
-	wq           *writeQuota
-
-	// Callback to state application's intentions to read data. This
-	// is used to adjust flow control, if needed.
-	requestRead func(int)
-
-	headerChan       chan struct{} // closed to indicate the end of header metadata.
-	headerChanClosed uint32        // set when headerChan is closed. Used to avoid closing headerChan multiple times.
-	// headerValid indicates whether a valid header was received.  Only
-	// meaningful after headerChan is closed (always call waitOnHeader() before
-	// reading its value).  Not valid on server side.
-	headerValid bool
-
-	// hdrMu protects header and trailer metadata on the server-side.
-	hdrMu sync.Mutex
-	// On client side, header keeps the received header metadata.
-	//
-	// On server side, header keeps the header set by SetHeader(). The complete
-	// header will merged into this after t.WriteHeader() is called.
-	header  metadata.MD
-	trailer metadata.MD // the key-value map of trailer metadata.
-
-	noHeaders bool // set if the client never received headers (set only after the stream is done).
-
-	// On the server-side, headerSent is atomically set to 1 when the headers are sent out.
-	headerSent uint32
-
-	state streamState
-
-	// On client-side it is the status error received from the server.
-	// On server-side it is unused.
-	status *status.Status
-
-	bytesReceived uint32 // indicates whether any bytes have been received on this stream
-	unprocessed   uint32 // set if the server sends a refused stream or GOAWAY including this stream
-
-	// contentSubtype is the content-subtype for requests.
-	// this must be lowercase or the behavior is undefined.
-	contentSubtype string
+	id               uint32             // 流的标识符
+	st               ServerTransport    // 对于client来说为nil
+	ct               *http2Client       // 对于server来说为nil
+	ctx              context.Context    // 流关联的ctx
+	cancel           context.CancelFunc // 对于客户端来说为nil
+	done             chan struct{}      // 客户端生效
+	ctxDone          <-chan struct{}    // 服务端生效
+	method           string             // rpc方法
+	recvCompress     string             // 输入流解压缩器
+	sendCompress     string             // 输出流解压缩器
+	buf              *recvBuffer        // 消息读取器
+	trReader         io.Reader          // 用以封装recvBuffer
+	fc               *inFlow            // 输入流流控
+	wq               *writeQuota        // 输出流流控
+	requestRead      func(int)          // Callback to state application's intentions to read data. This is used to adjust flow control, if needed.
+	headerChan       chan struct{}      // closed to indicate the end of header metadata.
+	headerChanClosed uint32             // 防止headerChan关闭多次
+	headerValid      bool               // 客户端有效
+	hdrMu            sync.Mutex         // 服务端有效
+	header           metadata.MD        // 对于客户端表示客户端接收到的header metadata；对于服务端，保存调用SetHeader()的header，header会被合并当调用WriteHeader()
+	trailer          metadata.MD        // trailer metadata.
+	noHeaders        bool               // 如果客户端没有收到header，设置此参数(只有当stream done才会设置).
+	headerSent       uint32             // 在服务端，当头被发送之后会设置
+	state            streamState        // 流状态
+	status           *status.Status     // On client-side it is the status error received from the server. On server-side it is unused.
+	bytesReceived    uint32             // indicates whether any bytes have been received on this stream
+	unprocessed      uint32             // set if the server sends a refused stream or GOAWAY including this stream
+	contentSubtype   string             // contentSubtype is the content-subtype for requests. this must be lowercase or the behavior is undefined.
 }
 
 // 只在服务端有效
@@ -298,20 +280,16 @@ func (s *Stream) waitOnHeader() {
 	}
 }
 
-// RecvCompress returns the compression algorithm applied to the inbound
-// message. It is empty string if there is no compression applied.
 func (s *Stream) RecvCompress() string {
 	s.waitOnHeader()
 	return s.recvCompress
 }
 
-// SetSendCompress sets the compression algorithm to the stream.
 func (s *Stream) SetSendCompress(str string) {
 	s.sendCompress = str
 }
 
-// Done returns a channel which is closed when it receives the final status
-// from the server.
+// 当客户端收到服务端发送来的最终的status，此chan会被关闭
 func (s *Stream) Done() <-chan struct{} {
 	return s.done
 }
@@ -355,35 +333,25 @@ func (s *Stream) Trailer() metadata.MD {
 	return c
 }
 
-// ContentSubtype returns the content-subtype for a request. For example, a
-// content-subtype of "proto" will result in a content-type of
-// "application/grpc+proto". This will always be lowercase.  See
-// https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#requests for
-// more details.
+// Example：application/grpc+proto
 func (s *Stream) ContentSubtype() string {
 	return s.contentSubtype
 }
 
-// Context returns the context of the stream.
 func (s *Stream) Context() context.Context {
 	return s.ctx
 }
 
-// Method returns the method for the stream.
 func (s *Stream) Method() string {
 	return s.method
 }
 
-// Status returns the status received from the server.
-// Status can be read safely only after the stream has ended,
-// that is, after Done() is closed.
+// 只有当stream为dong也就是Done() chan关闭之后才会被读取
 func (s *Stream) Status() *status.Status {
 	return s.status
 }
 
-// SetHeader sets the header metadata. This can be called multiple times.
-// Server side only.
-// This should not be called in parallel to other data writes.
+// 服务端设置header
 func (s *Stream) SetHeader(md metadata.MD) error {
 	if md.Len() == 0 {
 		return nil
@@ -397,9 +365,6 @@ func (s *Stream) SetHeader(md metadata.MD) error {
 	return nil
 }
 
-// SendHeader sends the given header metadata. The given metadata is
-// combined with any metadata set by previous calls to SetHeader and
-// then written to the transport stream.
 func (s *Stream) SendHeader(md metadata.MD) error {
 	return s.st.WriteHeader(s, md)
 }
@@ -420,18 +385,30 @@ func (s *Stream) SetTrailer(md metadata.MD) error {
 	return nil
 }
 
-func (s *Stream) write(m recvMsg) {
-	s.buf.put(m)
-}
-
-// Read reads all p bytes from the wire for this stream.
 func (s *Stream) Read(p []byte) (n int, err error) {
-	// Don't request a read if there was an error earlier
 	if er := s.trReader.(*transportReader).er; er != nil {
 		return 0, er
 	}
 	s.requestRead(len(p))
 	return io.ReadFull(s.trReader, p)
+}
+
+func (s *Stream) BytesReceived() bool {
+	return atomic.LoadUint32(&s.bytesReceived) == 1
+}
+
+// Unprocessed indicates whether the server did not process this stream --
+// i.e. it sent a refused stream or GOAWAY including this stream ID.
+func (s *Stream) Unprocessed() bool {
+	return atomic.LoadUint32(&s.unprocessed) == 1
+}
+
+func (s *Stream) GoString() string {
+	return fmt.Sprintf("<stream: %p, %v>", s, s.method)
+}
+
+func (s *Stream) write(m recvMsg) {
+	s.buf.put(m)
 }
 
 type transportReader struct {
@@ -450,55 +427,24 @@ func (t *transportReader) Read(p []byte) (n int, err error) {
 	return
 }
 
-func (s *Stream) BytesReceived() bool {
-	return atomic.LoadUint32(&s.bytesReceived) == 1
-}
-
-// Unprocessed indicates whether the server did not process this stream --
-// i.e. it sent a refused stream or GOAWAY including this stream ID.
-func (s *Stream) Unprocessed() bool {
-	return atomic.LoadUint32(&s.unprocessed) == 1
-}
-
-// GoString is implemented by Stream so context.String() won't
-// race when printing %#v.
-func (s *Stream) GoString() string {
-	return fmt.Sprintf("<stream: %p, %v>", s, s.method)
-}
-
-// state of transport
-type transportState int
-
-const (
-	reachable transportState = iota
-	closing
-	draining
-)
-
-// ServerConfig consists of all the configurations to establish a server transport.
 type ServerConfig struct {
 	MaxStreams            uint32
 	AuthInfo              credentials.AuthInfo
 	InTapHandle           tap.ServerInHandle
-	StatsHandler          stats.Handler
 	KeepaliveParams       keepalive.ServerParameters
 	KeepalivePolicy       keepalive.EnforcementPolicy
 	InitialWindowSize     int32
 	InitialConnWindowSize int32
 	WriteBufferSize       int
 	ReadBufferSize        int
-	ChannelzParentID      int64
 	MaxHeaderListSize     *uint32
 	HeaderTableSize       *uint32
 }
 
-// NewServerTransport creates a ServerTransport with conn or non-nil error
-// if it fails.
 func NewServerTransport(protocol string, conn net.Conn, config *ServerConfig) (ServerTransport, error) {
 	return newHTTP2Server(conn, config)
 }
 
-// ConnectOptions covers all relevant options for communicating with the server.
 type ConnectOptions struct {
 	// UserAgent is the application user agent.
 	UserAgent string
@@ -516,8 +462,6 @@ type ConnectOptions struct {
 	CredsBundle credentials.Bundle
 	// KeepaliveParams stores the keepalive parameters.
 	KeepaliveParams keepalive.ClientParameters
-	// StatsHandler stores the handler for stats.
-	StatsHandler stats.Handler
 	// InitialWindowSize sets the initial window size for a stream.
 	InitialWindowSize int32
 	// InitialConnWindowSize sets the initial window size for a connection.
@@ -532,17 +476,12 @@ type ConnectOptions struct {
 	MaxHeaderListSize *uint32
 }
 
-// NewClientTransport establishes the transport with the required ConnectOptions
-// and returns it to the caller.
 func NewClientTransport(connectCtx, ctx context.Context, addr resolver.Address, opts ConnectOptions, onPrefaceReceipt func(), onGoAway func(GoAwayReason), onClose func()) (ClientTransport, error) {
 	return newHTTP2Client(connectCtx, ctx, addr, opts, onPrefaceReceipt, onGoAway, onClose)
 }
 
-// Options provides additional hints and information for message
-// transmission.
 type Options struct {
-	// Last indicates whether this write is the last piece for
-	// this stream.
+	// 表明写是否是最后一个分片
 	Last bool
 }
 
@@ -572,8 +511,6 @@ type CallHdr struct {
 	PreviousAttempts int // value of grpc-previous-rpc-attempts header to set
 }
 
-// ClientTransport is the common interface for all gRPC client-side transport
-// implementations.
 type ClientTransport interface {
 	// Close tears down this transport. Once it returns, the transport
 	// should not be accessed any more. The caller must make sure this
@@ -625,43 +562,14 @@ type ClientTransport interface {
 	IncrMsgRecv()
 }
 
-// ServerTransport is the common interface for all gRPC server-side transport
-// implementations.
-//
-// Methods may be called concurrently from multiple goroutines, but
-// Write methods for a given Stream will be called serially.
 type ServerTransport interface {
-	// HandleStreams receives incoming streams using the given handler.
 	HandleStreams(func(*Stream), func(context.Context, string) context.Context)
-
-	// WriteHeader sends the header metadata for the given stream.
-	// WriteHeader may not be called on all streams.
 	WriteHeader(s *Stream, md metadata.MD) error
-
-	// Write sends the data for the given stream.
-	// Write may not be called on all streams.
 	Write(s *Stream, hdr []byte, data []byte, opts *Options) error
-
-	// WriteStatus sends the status of a stream to the client.  WriteStatus is
-	// the final call made on a stream and always occurs.
 	WriteStatus(s *Stream, st *status.Status) error
-
-	// Close tears down the transport. Once it is called, the transport
-	// should not be accessed any more. All the pending streams and their
-	// handlers will be terminated asynchronously.
 	Close() error
-
-	// RemoteAddr returns the remote network address.
 	RemoteAddr() net.Addr
-
-	// Drain notifies the client this ServerTransport stops accepting new RPCs.
-	Drain()
-
-	// IncrMsgSent increments the number of message sent through this transport.
-	IncrMsgSent()
-
-	// IncrMsgRecv increments the number of message received through this transport.
-	IncrMsgRecv()
+	Drain() // 通知客户端服务端已经停止接受流了
 }
 
 // connectionErrorf creates an ConnectionError with the specified error description.
@@ -728,30 +636,6 @@ const (
 	// "too_many_pings".
 	GoAwayTooManyPings GoAwayReason = 2
 )
-
-// channelzData is used to store channelz related data for http2Client and http2Server.
-// These fields cannot be embedded in the original structs (e.g. http2Client), since to do atomic
-// operation on int64 variable on 32-bit machine, user is responsible to enforce memory alignment.
-// Here, by grouping those int64 fields inside a struct, we are enforcing the alignment.
-type channelzData struct {
-	kpCount int64
-	// The number of streams that have started, including already finished ones.
-	streamsStarted int64
-	// Client side: The number of streams that have ended successfully by receiving
-	// EoS bit set frame from server.
-	// Server side: The number of streams that have ended successfully by sending
-	// frame with EoS bit set.
-	streamsSucceeded int64
-	streamsFailed    int64
-	// lastStreamCreatedTime stores the timestamp that the last stream gets created. It is of int64 type
-	// instead of time.Time since it's more costly to atomically update time.Time variable than int64
-	// variable. The same goes for lastMsgSentTime and lastMsgRecvTime.
-	lastStreamCreatedTime int64
-	msgSent               int64
-	msgRecv               int64
-	lastMsgSentTime       int64
-	lastMsgRecvTime       int64
-}
 
 // ContextErr converts the error from context package into a status error.
 func ContextErr(err error) error {

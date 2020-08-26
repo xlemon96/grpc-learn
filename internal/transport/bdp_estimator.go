@@ -1,21 +1,3 @@
-/*
- *
- * Copyright 2017 gRPC authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- */
-
 package transport
 
 import (
@@ -24,9 +6,6 @@ import (
 )
 
 const (
-	// bdpLimit is the maximum value the flow control windows will be increased
-	// to.  TCP typically limits this to 4MB, but some systems go up to 16MB.
-	// Since this is only a limit, it is safe to make it optimistic.
 	bdpLimit = (1 << 20) * 16
 	// alpha is a constant factor used to keep a moving average
 	// of RTTs.
@@ -42,35 +21,20 @@ const (
 	gamma = 2
 )
 
-// Adding arbitrary data to ping so that its ack can be identified.
-// Easter-egg: what does the ping message say?
 var bdpPing = &ping{data: [8]byte{2, 4, 16, 16, 9, 14, 7, 7}}
 
 type bdpEstimator struct {
-	// sentAt is the time when the ping was sent.
-	sentAt time.Time
-
-	mu sync.Mutex
-	// bdp is the current bdp estimate.
-	bdp uint32
-	// sample is the number of bytes received in one measurement cycle.
-	sample uint32
-	// bwMax is the maximum bandwidth noted so far (bytes/sec).
-	bwMax float64
-	// bool to keep track of the beginning of a new measurement cycle.
-	isSent bool
-	// Callback to update the window sizes.
-	updateFlowControl func(n uint32)
-	// sampleCount is the number of samples taken so far.
-	sampleCount uint64
-	// round trip time (seconds)
-	rtt float64
+	sentAt            time.Time      // ping包何时发送
+	mu                sync.Mutex     // 锁
+	bdp               uint32         // bdp is the current bdp estimate.
+	sample            uint32         // sample is the number of bytes received in one measurement cycle.
+	bwMax             float64        // bwMax is the maximum bandwidth noted so far (bytes/sec).
+	isSent            bool           // bool to keep track of the beginning of a new measurement cycle.
+	updateFlowControl func(n uint32) // 回调函数
+	sampleCount       uint64         // sampleCount is the number of samples taken so far.
+	rtt               float64        // round trip time (seconds)
 }
 
-// timesnap registers the time bdp ping was sent out so that
-// network rtt can be calculated when its ack is received.
-// It is called (by controller) when the bdpPing is
-// being written on the wire.
 func (b *bdpEstimator) timesnap(d [8]byte) {
 	if bdpPing.data != d {
 		return
