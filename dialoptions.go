@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/internal"
 	internalbackoff "google.golang.org/grpc/internal/backoff"
 	"google.golang.org/grpc/internal/envconfig"
@@ -36,29 +37,23 @@ import (
 	"google.golang.org/grpc/stats"
 )
 
-// dialOptions configure a Dial call. dialOptions are set by the DialOption
-// values passed to Dial.
+// 客户端配置结构体
 type dialOptions struct {
-	unaryInt  UnaryClientInterceptor
-	streamInt StreamClientInterceptor
-
-	chainUnaryInts  []UnaryClientInterceptor
-	chainStreamInts []StreamClientInterceptor
-
-	cp              Compressor
-	dc              Decompressor
-	bs              internalbackoff.Strategy
-	block           bool
-	returnLastError bool
-	insecure        bool
-	timeout         time.Duration
-	scChan          <-chan ServiceConfig
-	authority       string
-	copts           transport.ConnectOptions
-	callOptions     []CallOption
-	// This is used by WithBalancerName dial option.
+	unaryInt                    UnaryClientInterceptor
+	streamInt                   StreamClientInterceptor
+	chainUnaryInts              []UnaryClientInterceptor
+	chainStreamInts             []StreamClientInterceptor
+	cp                          encoding.Compressor
+	bs                          internalbackoff.Strategy
+	block                       bool
+	returnLastError             bool
+	insecure                    bool
+	timeout                     time.Duration
+	scChan                      <-chan ServiceConfig
+	authority                   string
+	copts                       transport.ConnectOptions
+	callOptions                 []CallOption
 	balancerBuilder             balancer.Builder
-	channelzParentID            int64
 	disableServiceConfig        bool
 	disableRetry                bool
 	disableHealthCheck          bool
@@ -74,21 +69,10 @@ type dialOptions struct {
 	withProxy         bool
 }
 
-// DialOption configures how we set up the connection.
 type DialOption interface {
 	apply(*dialOptions)
 }
 
-// EmptyDialOption does not alter the dial configuration. It can be embedded in
-// another structure to build custom dial options.
-//
-// This API is EXPERIMENTAL.
-type EmptyDialOption struct{}
-
-func (EmptyDialOption) apply(*dialOptions) {}
-
-// funcDialOption wraps a function that modifies dialOptions into an
-// implementation of the DialOption interface.
 type funcDialOption struct {
 	f func(*dialOptions)
 }
@@ -176,25 +160,9 @@ func WithCodec(c Codec) DialOption {
 // UseCompressor CallOption.
 //
 // Deprecated: use UseCompressor instead.  Will be supported throughout 1.x.
-func WithCompressor(cp Compressor) DialOption {
+func WithCompressor(cp encoding.Compressor) DialOption {
 	return newFuncDialOption(func(o *dialOptions) {
 		o.cp = cp
-	})
-}
-
-// WithDecompressor returns a DialOption which sets a Decompressor to use for
-// incoming message decompression.  If incoming response messages are encoded
-// using the decompressor's Type(), it will be used.  Otherwise, the message
-// encoding will be used to look up the compressor registered via
-// encoding.RegisterCompressor, which will then be used to decompress the
-// message.  If no compressor is registered for the encoding, an Unimplemented
-// status error will be returned.
-//
-// Deprecated: use encoding.RegisterCompressor instead.  Will be supported
-// throughout 1.x.
-func WithDecompressor(dc Decompressor) DialOption {
-	return newFuncDialOption(func(o *dialOptions) {
-		o.dc = dc
 	})
 }
 

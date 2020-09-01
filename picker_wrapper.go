@@ -1,37 +1,16 @@
-/*
- *
- * Copyright 2017 gRPC authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- */
-
 package grpc
 
 import (
 	"context"
-	"io"
 	"sync"
 
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/internal/channelz"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/status"
 )
 
-// pickerWrapper is a wrapper of balancer.Picker. It blocks on certain pick
-// actions and unblock when there's a picker update.
+// 封装picker
 type pickerWrapper struct {
 	mu         sync.Mutex
 	done       bool
@@ -43,7 +22,7 @@ func newPickerWrapper() *pickerWrapper {
 	return &pickerWrapper{blockingCh: make(chan struct{})}
 }
 
-// updatePicker is called by UpdateBalancerState. It unblocks all blocked pick.
+// 更新一个picker同时通知所有等待的g
 func (pw *pickerWrapper) updatePicker(p balancer.Picker) {
 	pw.mu.Lock()
 	if pw.done {
@@ -51,27 +30,9 @@ func (pw *pickerWrapper) updatePicker(p balancer.Picker) {
 		return
 	}
 	pw.picker = p
-	// pw.blockingCh should never be nil.
 	close(pw.blockingCh)
 	pw.blockingCh = make(chan struct{})
 	pw.mu.Unlock()
-}
-
-func doneChannelzWrapper(acw *acBalancerWrapper, done func(balancer.DoneInfo)) func(balancer.DoneInfo) {
-	acw.mu.Lock()
-	ac := acw.ac
-	acw.mu.Unlock()
-	ac.incrCallsStarted()
-	return func(b balancer.DoneInfo) {
-		if b.Err != nil && b.Err != io.EOF {
-			ac.incrCallsFailed()
-		} else {
-			ac.incrCallsSucceeded()
-		}
-		if done != nil {
-			done(b)
-		}
-	}
 }
 
 // pick returns the transport that will be used for the RPC.
@@ -83,7 +44,6 @@ func doneChannelzWrapper(acw *acBalancerWrapper, done func(balancer.DoneInfo)) f
 // When one of these situations happens, pick blocks until the picker gets updated.
 func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.PickInfo) (transport.ClientTransport, func(balancer.DoneInfo), error) {
 	var ch chan struct{}
-
 	var lastPickErr error
 	for {
 		pw.mu.Lock()
@@ -91,7 +51,6 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 			pw.mu.Unlock()
 			return nil, nil, ErrClientConnClosing
 		}
-
 		if pw.picker == nil {
 			ch = pw.blockingCh
 		}
@@ -118,13 +77,10 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 			}
 			continue
 		}
-
 		ch = pw.blockingCh
 		p := pw.picker
 		pw.mu.Unlock()
-
 		pickResult, err := p.Pick(info)
-
 		if err != nil {
 			if err == balancer.ErrNoSubConnAvailable {
 				continue
@@ -141,16 +97,12 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 			}
 			return nil, nil, status.Error(codes.Unavailable, err.Error())
 		}
-
 		acw, ok := pickResult.SubConn.(*acBalancerWrapper)
 		if !ok {
-			logger.Error("subconn returned from pick is not *acBalancerWrapper")
+			logger.Error("subConn returned from pick is not *acBalancerWrapper")
 			continue
 		}
 		if t, ok := acw.getAddrConn().getReadyTransport(); ok {
-			if channelz.IsOn() {
-				return t, doneChannelzWrapper(acw, pickResult.Done), nil
-			}
 			return t, pickResult.Done, nil
 		}
 		if pickResult.Done != nil {
@@ -166,6 +118,8 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 	}
 }
 
+// 关闭
+// 置done为true
 func (pw *pickerWrapper) close() {
 	pw.mu.Lock()
 	defer pw.mu.Unlock()

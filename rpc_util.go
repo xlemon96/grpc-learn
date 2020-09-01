@@ -58,7 +58,7 @@ type callInfo struct {
 	maxSendMessageSize    *int
 	creds                 credentials.PerRPCCredentials
 	contentSubtype        string
-	codec                 baseCodec
+	codec                 encoding.Codec
 	maxRetryRPCBufferSize int
 }
 
@@ -326,7 +326,7 @@ func (o ForceCodecCallOption) after(c *callInfo, attempt *csAttempt) {}
 // an encoding.Codec.
 //
 // Deprecated: use ForceCodec instead.
-func CallCustomCodec(codec Codec) CallOption {
+func CallCustomCodec(codec encoding.Codec) CallOption {
 	return CustomCodecCallOption{Codec: codec}
 }
 
@@ -335,7 +335,7 @@ func CallCustomCodec(codec Codec) CallOption {
 //
 // This is an EXPERIMENTAL API.
 type CustomCodecCallOption struct {
-	Codec Codec
+	Codec encoding.Codec
 }
 
 func (o CustomCodecCallOption) before(c *callInfo) error {
@@ -392,7 +392,7 @@ func recvAndDecompress(p *parser, s *transport.Stream,
 }
 
 // 序列化一个消息
-func encode(c baseCodec, msg interface{}) ([]byte, error) {
+func encode(c encoding.Codec, msg interface{}) ([]byte, error) {
 	if msg == nil {
 		return nil, nil
 	}
@@ -493,7 +493,7 @@ func decompress(compressor encoding.Compressor, d []byte, maxReceiveMessageSize 
 }
 
 // 读取一个消息，并且反序列化到m
-func recv(p *parser, c baseCodec, s *transport.Stream, m interface{}, maxReceiveMessageSize int, compressor encoding.Compressor) error {
+func recv(p *parser, c encoding.Codec, s *transport.Stream, m interface{}, maxReceiveMessageSize int, compressor encoding.Compressor) error {
 	d, err := recvAndDecompress(p, s, maxReceiveMessageSize, compressor)
 	if err != nil {
 		return err
@@ -510,14 +510,14 @@ type rpcInfo struct {
 }
 
 type compressorInfo struct {
-	codec baseCodec
+	codec encoding.Codec
 	comp  encoding.Compressor
 }
 
 type rpcInfoContextKey struct{}
 
 // 客户端会用
-func newContextWithRPCInfo(ctx context.Context, failfast bool, codec baseCodec, comp encoding.Compressor) context.Context {
+func newContextWithRPCInfo(ctx context.Context, failfast bool, codec encoding.Codec, comp encoding.Compressor) context.Context {
 	return context.WithValue(ctx, rpcInfoContextKey{}, &rpcInfo{
 		failfast: failfast,
 		preloaderInfo: &compressorInfo{

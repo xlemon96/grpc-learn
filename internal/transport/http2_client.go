@@ -29,12 +29,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// clientConnectionCounter counts the number of connections a client has
-// initiated (equal to the number of http2Clients created). Must be accessed
-// atomically.
+// 表示创建了多少个http2Client
 var clientConnectionCounter uint64
 
-// http2Client implements the ClientTransport interface with HTTP2.
 type http2Client struct {
 	lastRead   int64 // Keep this field 64-bit aligned. Accessed atomically.
 	ctx        context.Context
@@ -68,8 +65,6 @@ type http2Client struct {
 
 	kp               keepalive.ClientParameters
 	keepaliveEnabled bool
-
-	statsHandler stats.Handler
 
 	initialWindowSize int32
 
@@ -106,10 +101,6 @@ type http2Client struct {
 	// This is checked before attempting to signal the above condition
 	// variable.
 	kpDormant bool
-
-	// Fields below are for channelz metric collection.
-	channelzID int64 // channelz unique identification number
-	czData     *channelzData
 
 	onGoAway func(GoAwayReason)
 	onClose  func()
@@ -442,13 +433,6 @@ func (t *http2Client) createHeaderFields(ctx context.Context, callHdr *CallHdr) 
 	for k, v := range callAuthData {
 		headerFields = append(headerFields, hpack.HeaderField{Name: k, Value: encodeMetadataHeader(k, v)})
 	}
-	if b := stats.OutgoingTags(ctx); b != nil {
-		headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-tags-bin", Value: encodeBinHeader(b)})
-	}
-	if b := stats.OutgoingTrace(ctx); b != nil {
-		headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-trace-bin", Value: encodeBinHeader(b)})
-	}
-
 	if md, added, ok := metadata.FromOutgoingContextRaw(ctx); ok {
 		var k string
 		for k, vv := range md {
