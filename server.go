@@ -21,23 +21,24 @@ import (
 	"google.golang.org/grpc/internal/grpcrand"
 	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/transport"
-	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/tap"
 )
 
 const (
 	defaultServerMaxReceiveMessageSize = 1024 * 1024 * 4
 	defaultServerMaxSendMessageSize    = math.MaxInt32
+
+	serverWorkerResetThreshold = 1 << 16
 )
 
-const serverWorkerResetThreshold = 1 << 16
+var (
+	ErrServerStopped = errors.New("grpc: the server has been stopped")
 
-var ErrServerStopped = errors.New("grpc: the server has been stopped")
+	statusOK = status.New(codes.OK, "")
 
-var statusOK = status.New(codes.OK, "")
-var logger = grpclog.Component("core")
+	logger = grpclog.Component("core")
+)
 
 type methodHandler func(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor UnaryServerInterceptor) (interface{}, error)
 
@@ -48,6 +49,7 @@ type MethodDesc struct {
 }
 
 // 一个服务的描述
+// 给编译proto时候用
 type ServiceDesc struct {
 	ServiceName string      // 服务名
 	HandlerType interface{} // 指向service，检查是否满足接口需求
@@ -56,17 +58,12 @@ type ServiceDesc struct {
 	Metadata    interface{}
 }
 
+// grpc server内部用
 type service struct {
 	server   interface{}
 	md       map[string]*MethodDesc
 	sd       map[string]*StreamDesc
 	metadata interface{}
-}
-
-type serverWorkerData struct {
-	st     transport.ServerTransport
-	wg     *sync.WaitGroup
-	stream *transport.Stream
 }
 
 type MethodInfo struct {
@@ -78,6 +75,12 @@ type MethodInfo struct {
 type ServiceInfo struct {
 	Methods  []MethodInfo
 	Metadata interface{}
+}
+
+type serverWorkerData struct {
+	st     transport.ServerTransport
+	wg     *sync.WaitGroup
+	stream *transport.Stream
 }
 
 // 服务器结构体
@@ -94,218 +97,6 @@ type Server struct {
 	done                 *grpcsync.Event
 	serveWG              sync.WaitGroup // 保证g优雅退出
 	serverWorkerChannels []chan *serverWorkerData
-}
-
-type serverOptions struct {
-	creds                 credentials.TransportCredentials
-	codec                 baseCodec // 序列化和反序列化
-	unaryInt              UnaryServerInterceptor
-	streamInt             StreamServerInterceptor
-	chainUnaryInts        []UnaryServerInterceptor
-	chainStreamInts       []StreamServerInterceptor
-	inTapHandle           tap.ServerInHandle
-	maxConcurrentStreams  uint32
-	maxReceiveMessageSize int
-	maxSendMessageSize    int
-	unknownStreamDesc     *StreamDesc
-	keepaliveParams       keepalive.ServerParameters
-	keepalivePolicy       keepalive.EnforcementPolicy
-	initialWindowSize     int32
-	initialConnWindowSize int32
-	writeBufferSize       int
-	readBufferSize        int
-	connectionTimeout     time.Duration
-	maxHeaderListSize     *uint32
-	headerTableSize       *uint32
-	numServerWorkers      uint32
-}
-
-var defaultServerOptions = serverOptions{
-	maxReceiveMessageSize: defaultServerMaxReceiveMessageSize,
-	maxSendMessageSize:    defaultServerMaxSendMessageSize,
-	connectionTimeout:     120 * time.Second,
-	writeBufferSize:       defaultWriteBufSize,
-	readBufferSize:        defaultReadBufSize,
-}
-
-// 服务器配置
-type ServerOption interface {
-	apply(*serverOptions)
-}
-
-type funcServerOption struct {
-	f func(*serverOptions)
-}
-
-func (fdo *funcServerOption) apply(do *serverOptions) {
-	fdo.f(do)
-}
-
-func newFuncServerOption(f func(*serverOptions)) *funcServerOption {
-	return &funcServerOption{
-		f: f,
-	}
-}
-
-func WriteBufferSize(s int) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.writeBufferSize = s
-	})
-}
-
-func ReadBufferSize(s int) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.readBufferSize = s
-	})
-}
-
-// 流的窗口大小
-func InitialWindowSize(s int32) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.initialWindowSize = s
-	})
-}
-
-// 连接的窗口大小
-func InitialConnWindowSize(s int32) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.initialConnWindowSize = s
-	})
-}
-
-func KeepaliveParams(kp keepalive.ServerParameters) ServerOption {
-	if kp.Time > 0 && kp.Time < time.Second {
-		logger.Warning("Adjusting keepalive ping interval to minimum period of 1s")
-		kp.Time = time.Second
-	}
-	return newFuncServerOption(func(o *serverOptions) {
-		o.keepaliveParams = kp
-	})
-}
-
-func KeepaliveEnforcementPolicy(kep keepalive.EnforcementPolicy) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.keepalivePolicy = kep
-	})
-}
-
-func CustomCodec(codec encoding.Codec) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.codec = codec
-	})
-}
-
-func MaxMsgSize(m int) ServerOption {
-	return MaxRecvMsgSize(m)
-}
-
-func MaxRecvMsgSize(m int) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.maxReceiveMessageSize = m
-	})
-}
-
-func MaxSendMsgSize(m int) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.maxSendMessageSize = m
-	})
-}
-
-func MaxConcurrentStreams(n uint32) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.maxConcurrentStreams = n
-	})
-}
-
-// 鉴权相关
-func Creds(c credentials.TransportCredentials) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.creds = c
-	})
-}
-
-// 单次调用拦截器
-func UnaryInterceptor(i UnaryServerInterceptor) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		if o.unaryInt != nil {
-			panic("The unary server interceptor was already set and may not be reset.")
-		}
-		o.unaryInt = i
-	})
-}
-
-// 单次调用拦截器chain
-func ChainUnaryInterceptor(interceptors ...UnaryServerInterceptor) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.chainUnaryInts = append(o.chainUnaryInts, interceptors...)
-	})
-}
-
-// 流式调用拦截器
-func StreamInterceptor(i StreamServerInterceptor) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		if o.streamInt != nil {
-			panic("The stream server interceptor was already set and may not be reset.")
-		}
-		o.streamInt = i
-	})
-}
-
-// 流式调用拦截器chain
-func ChainStreamInterceptor(interceptors ...StreamServerInterceptor) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.chainStreamInts = append(o.chainStreamInts, interceptors...)
-	})
-}
-
-func InTapHandle(h tap.ServerInHandle) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		if o.inTapHandle != nil {
-			panic("The tap handle was already set and may not be reset.")
-		}
-		o.inTapHandle = h
-	})
-}
-
-// 出现未注册服务处理器吧
-func UnknownServiceHandler(streamHandler StreamHandler) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.unknownStreamDesc = &StreamDesc{
-			StreamName:    "unknown_service_handler",
-			Handler:       streamHandler,
-			ClientStreams: true,
-			ServerStreams: true,
-		}
-	})
-}
-
-// 连接超时时间
-func ConnectionTimeout(d time.Duration) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.connectionTimeout = d
-	})
-}
-
-// 未压缩过的头部列表的大小
-func MaxHeaderListSize(s uint32) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.maxHeaderListSize = &s
-	})
-}
-
-// 动态表的大小
-func HeaderTableSize(s uint32) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		o.headerTableSize = &s
-	})
-}
-
-// 处理stream的worker数量
-func NumStreamWorkers(numServerWorkers uint32) ServerOption {
-	// 初步测试，worker=cpu数量，性能最高
-	return newFuncServerOption(func(o *serverOptions) {
-		o.numServerWorkers = numServerWorkers
-	})
 }
 
 func NewServer(opt ...ServerOption) *Server {
@@ -330,36 +121,6 @@ func NewServer(opt ...ServerOption) *Server {
 	return s
 }
 
-// 本身g池化作用不明显，但是由于调用链较长，会导致g频繁的扩容
-// 因此需要重复利用已经扩容过的g。又为了保证资源不会被一只占用，定时将g重置
-func (s *Server) initServerWorkers() {
-	s.serverWorkerChannels = make([]chan *serverWorkerData, s.opts.numServerWorkers)
-	for i := uint32(0); i < s.opts.numServerWorkers; i++ {
-		s.serverWorkerChannels[i] = make(chan *serverWorkerData)
-		go s.serverWorker(s.serverWorkerChannels[i])
-	}
-}
-
-func (s *Server) serverWorker(ch chan *serverWorkerData) {
-	// 确保不会所有的g同时reset
-	threshold := serverWorkerResetThreshold + grpcrand.Intn(serverWorkerResetThreshold)
-	for completed := 0; completed < threshold; completed++ {
-		data, ok := <-ch
-		if !ok {
-			return
-		}
-		s.handleStream(data.st, data.stream)
-		data.wg.Done()
-	}
-	go s.serverWorker(ch)
-}
-
-func (s *Server) stopServerWorkers() {
-	for i := uint32(0); i < s.opts.numServerWorkers; i++ {
-		close(s.serverWorkerChannels[i])
-	}
-}
-
 // 注册一个service到grpc server
 func (s *Server) RegisterService(sd *ServiceDesc, ss interface{}) {
 	ht := reflect.TypeOf(sd.HandlerType).Elem()
@@ -368,34 +129,6 @@ func (s *Server) RegisterService(sd *ServiceDesc, ss interface{}) {
 		logger.Fatalf("grpc: Server.RegisterService found the handler of type %v that does not satisfy %v", st, ht)
 	}
 	s.register(sd, ss)
-}
-
-// 实际的注册函数
-// 将用户实现的结构体和protobuf生成的结构体写入到server
-func (s *Server) register(sd *ServiceDesc, ss interface{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.serve {
-		logger.Fatalf("grpc: Server.RegisterService after Server.Serve for %q", sd.ServiceName)
-	}
-	if _, ok := s.m[sd.ServiceName]; ok {
-		logger.Fatalf("grpc: Server.RegisterService found duplicate service registration for %q", sd.ServiceName)
-	}
-	srv := &service{
-		server:   ss,
-		md:       make(map[string]*MethodDesc),
-		sd:       make(map[string]*StreamDesc),
-		metadata: sd.Metadata,
-	}
-	for i := range sd.Methods {
-		d := &sd.Methods[i]
-		srv.md[d.MethodName] = d
-	}
-	for i := range sd.Streams {
-		d := &sd.Streams[i]
-		srv.sd[d.StreamName] = d
-	}
-	s.m[sd.ServiceName] = srv
 }
 
 // 获取服务信息
@@ -493,8 +226,125 @@ func (s *Server) Serve(lis net.Listener) error {
 	}
 }
 
+// 关闭服务器
+func (s *Server) Stop() {
+	s.quit.Fire()
+	defer func() {
+		s.serveWG.Wait()
+		s.done.Fire()
+	}()
+	s.mu.Lock()
+	listeners := s.lis
+	s.lis = nil
+	st := s.conns
+	s.conns = nil
+	// interrupt GracefulStop if Stop and GracefulStop are called concurrently.
+	s.cv.Broadcast()
+	s.mu.Unlock()
+
+	for lis := range listeners {
+		lis.Close()
+	}
+	for c := range st {
+		c.Close()
+	}
+	if s.opts.numServerWorkers > 0 {
+		s.stopServerWorkers()
+	}
+}
+
+// 优雅关闭rpc服务器
+func (s *Server) GracefulStop() {
+	s.quit.Fire()
+	defer s.done.Fire()
+	s.mu.Lock()
+	if s.conns == nil {
+		s.mu.Unlock()
+		return
+	}
+	for lis := range s.lis {
+		lis.Close()
+	}
+	s.lis = nil
+	if !s.drain {
+		for st := range s.conns {
+			st.Drain()
+		}
+		s.drain = true
+	}
+	// Wait for serving threads to be ready to exit.  Only then can we be sure no
+	// new conns will be created.
+	s.mu.Unlock()
+	s.serveWG.Wait()
+	s.mu.Lock()
+	for len(s.conns) != 0 {
+		s.cv.Wait()
+	}
+	s.conns = nil
+	s.mu.Unlock()
+}
+
+// 本身g池化作用不明显，但是由于调用链较长，会导致g频繁的扩容
+// 因此需要重复利用已经扩容过的g。又为了保证资源不会被一只占用，定时将g重置
+func (s *Server) initServerWorkers() {
+	s.serverWorkerChannels = make([]chan *serverWorkerData, s.opts.numServerWorkers)
+	for i := uint32(0); i < s.opts.numServerWorkers; i++ {
+		s.serverWorkerChannels[i] = make(chan *serverWorkerData)
+		go s.serverWorker(s.serverWorkerChannels[i])
+	}
+}
+
+func (s *Server) serverWorker(ch chan *serverWorkerData) {
+	// 确保不会所有的g同时reset
+	threshold := serverWorkerResetThreshold + grpcrand.Intn(serverWorkerResetThreshold)
+	for completed := 0; completed < threshold; completed++ {
+		data, ok := <-ch
+		if !ok {
+			return
+		}
+		s.handleStream(data.st, data.stream)
+		data.wg.Done()
+	}
+	go s.serverWorker(ch)
+}
+
+func (s *Server) stopServerWorkers() {
+	for i := uint32(0); i < s.opts.numServerWorkers; i++ {
+		close(s.serverWorkerChannels[i])
+	}
+}
+
+// 实际的注册函数
+// 将用户实现的结构体和protobuf生成的结构体写入到server
+func (s *Server) register(sd *ServiceDesc, ss interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.serve {
+		logger.Fatalf("grpc: Server.RegisterService after Server.Serve for %q", sd.ServiceName)
+	}
+	if _, ok := s.m[sd.ServiceName]; ok {
+		logger.Fatalf("grpc: Server.RegisterService found duplicate service registration for %q", sd.ServiceName)
+	}
+	srv := &service{
+		server:   ss,
+		md:       make(map[string]*MethodDesc),
+		sd:       make(map[string]*StreamDesc),
+		metadata: sd.Metadata,
+	}
+	for i := range sd.Methods {
+		d := &sd.Methods[i]
+		srv.md[d.MethodName] = d
+	}
+	for i := range sd.Streams {
+		d := &sd.Streams[i]
+		srv.sd[d.StreamName] = d
+	}
+	s.m[sd.ServiceName] = srv
+}
+
 // conn处理函数
 func (s *Server) handleRawConn(rawConn net.Conn) {
+	// 如果已经开始退出，则直接关闭连接并return
 	if s.quit.HasFired() {
 		rawConn.Close()
 		return
@@ -795,7 +645,7 @@ func (s *Server) sendResponse(t transport.ServerTransport, stream *transport.Str
 
 // contentSubtype一定是小写，不允许返回空
 // 默认用proto进行序列化
-func (s *Server) getCodec(contentSubtype string) baseCodec {
+func (s *Server) getCodec(contentSubtype string) encoding.Codec {
 	if s.opts.codec != nil {
 		return s.opts.codec
 	}
@@ -809,68 +659,8 @@ func (s *Server) getCodec(contentSubtype string) baseCodec {
 	return codec
 }
 
-// 关闭服务器
-func (s *Server) Stop() {
-	s.quit.Fire()
-
-	defer func() {
-		s.serveWG.Wait()
-		s.done.Fire()
-	}()
-	s.mu.Lock()
-	listeners := s.lis
-	s.lis = nil
-	st := s.conns
-	s.conns = nil
-	// interrupt GracefulStop if Stop and GracefulStop are called concurrently.
-	s.cv.Broadcast()
-	s.mu.Unlock()
-
-	for lis := range listeners {
-		lis.Close()
-	}
-	for c := range st {
-		c.Close()
-	}
-	if s.opts.numServerWorkers > 0 {
-		s.stopServerWorkers()
-	}
-}
-
-// 优雅关闭rpc服务器
-func (s *Server) GracefulStop() {
-	s.quit.Fire()
-	defer s.done.Fire()
-	s.mu.Lock()
-	if s.conns == nil {
-		s.mu.Unlock()
-		return
-	}
-	for lis := range s.lis {
-		lis.Close()
-	}
-	s.lis = nil
-	if !s.drain {
-		for st := range s.conns {
-			st.Drain()
-		}
-		s.drain = true
-	}
-	// Wait for serving threads to be ready to exit.  Only then can we be sure no
-	// new conns will be created.
-	s.mu.Unlock()
-	s.serveWG.Wait()
-	s.mu.Lock()
-	for len(s.conns) != 0 {
-		s.cv.Wait()
-	}
-	s.conns = nil
-	s.mu.Unlock()
-}
-
+// 构造流式接口的拦截器
 func chainStreamServerInterceptors(s *Server) {
-	// Prepend opts.streamInt to the chaining interceptors if it exists, since streamInt will
-	// be executed before any other chained interceptors.
 	interceptors := s.opts.chainStreamInts
 	if s.opts.streamInt != nil {
 		interceptors = append([]StreamServerInterceptor{s.opts.streamInt}, s.opts.chainStreamInts...)
@@ -886,7 +676,6 @@ func chainStreamServerInterceptors(s *Server) {
 			return interceptors[0](srv, ss, info, getChainStreamHandler(interceptors, 0, info, handler))
 		}
 	}
-
 	s.opts.streamInt = chainedInt
 }
 
@@ -894,15 +683,13 @@ func getChainStreamHandler(interceptors []StreamServerInterceptor, curr int, inf
 	if curr == len(interceptors)-1 {
 		return finalHandler
 	}
-
 	return func(srv interface{}, ss ServerStream) error {
 		return interceptors[curr+1](srv, ss, info, getChainStreamHandler(interceptors, curr+1, info, finalHandler))
 	}
 }
 
+// 构造非流式接口的拦截器
 func chainUnaryServerInterceptors(s *Server) {
-	// Prepend opts.unaryInt to the chaining interceptors if it exists, since unaryInt will
-	// be executed before any other chained interceptors.
 	interceptors := s.opts.chainUnaryInts
 	if s.opts.unaryInt != nil {
 		interceptors = append([]UnaryServerInterceptor{s.opts.unaryInt}, s.opts.chainUnaryInts...)
@@ -918,7 +705,6 @@ func chainUnaryServerInterceptors(s *Server) {
 			return interceptors[0](ctx, req, info, getChainUnaryHandler(interceptors, 0, info, handler))
 		}
 	}
-
 	s.opts.unaryInt = chainedInt
 }
 
@@ -926,7 +712,6 @@ func getChainUnaryHandler(interceptors []UnaryServerInterceptor, curr int, info 
 	if curr == len(interceptors)-1 {
 		return finalHandler
 	}
-
 	return func(ctx context.Context, req interface{}) (interface{}, error) {
 		return interceptors[curr+1](ctx, req, info, getChainUnaryHandler(interceptors, curr+1, info, finalHandler))
 	}
@@ -951,10 +736,10 @@ func ServerTransportStreamFromContext(ctx context.Context) ServerTransportStream
 	return s
 }
 
-// All the metadata will be sent out when one of the following happens:
-//  - grpc.SendHeader() is called;
-//  - The first response is sent out;
-//  - An RPC status is sent out (error or success).
+// 所有的metadata将要发送，当以下任何一种情况发生:
+//  - grpc.SendHeader() 已经被调用
+//  - 第一个response已经被发出
+//  - 一个 rpc status 已经被发出(不论是error或者success)
 func SetHeader(ctx context.Context, md metadata.MD) error {
 	if md.Len() == 0 {
 		return nil

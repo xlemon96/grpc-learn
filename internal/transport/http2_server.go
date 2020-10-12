@@ -353,12 +353,6 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	if len(state.data.mdata) > 0 {
 		s.ctx = metadata.NewIncomingContext(s.ctx, state.data.mdata)
 	}
-	//if state.data.statsTags != nil {
-	//	s.ctx = stats.SetIncomingTags(s.ctx, state.data.statsTags)
-	//}
-	//if state.data.statsTrace != nil {
-	//	s.ctx = stats.SetIncomingTrace(s.ctx, state.data.statsTrace)
-	//}
 	if t.inTapHandle != nil {
 		var err error
 		info := &tap.Info{
